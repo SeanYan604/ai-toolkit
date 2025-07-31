@@ -9,6 +9,39 @@ from dotenv import load_dotenv
 # Load the .env file if it exists
 load_dotenv()
 
+# HuggingFace authentication setup
+try:
+    from huggingface_hub import login
+    
+    # Try to get token from environment variable first
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    
+    if hf_token:
+        print("🤗 Found HuggingFace token in environment, logging in...")
+        login(token=hf_token)
+        print("✅ Successfully logged in to HuggingFace Hub")
+    else:
+        print("⚠️  No HuggingFace token found in environment variables.")
+        print("   Set HF_TOKEN or HUGGING_FACE_HUB_TOKEN to download private/gated models.")
+        print("   You can get your token from: https://huggingface.co/settings/tokens")
+        
+        # Try to use cached credentials if available
+        try:
+            from huggingface_hub import HfFolder
+            cached_token = HfFolder.get_token()
+            if cached_token:
+                print("🔑 Using cached HuggingFace credentials")
+            else:
+                print("💡 Tip: Run 'huggingface-cli login' to cache your token, or set HF_TOKEN environment variable")
+        except Exception:
+            print("💡 Tip: Install huggingface-hub and run 'huggingface-cli login' to authenticate")
+            
+except ImportError:
+    print("⚠️  huggingface_hub not found. Install with: pip install huggingface_hub")
+except Exception as e:
+    print(f"⚠️  HuggingFace authentication failed: {e}")
+    print("   Continuing without authentication. Some models may not be accessible.")
+
 sys.path.insert(0, os.getcwd())
 # must come before ANY torch or fastai imports
 # import toolkit.cuda_malloc
