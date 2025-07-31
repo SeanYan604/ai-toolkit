@@ -182,3 +182,41 @@ cython_debug/
 aitk_db.db
 /notes.md
 /data
+
+# Node.js dependencies and files
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+*.tgz
+.npm
+.eslintcache
+
+# Next.js build output
+.next/
+.next-env
+out/
+
+# UI specific ignores
+/ui/.next/
+/ui/out/
+/ui/node_modules/
+/ui/.env.local
+/ui/.env.development.local
+/ui/.env.test.local
+/ui/.env.production.local
+
+# Temporary files
+*.tmp
+*.temp
+*~
+.temp/
+.tmp/
+
+# Test and debug files
+test_*.js
+debug_*.py
+test_*.py
+*.test.js
+*.debug.js

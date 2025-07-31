@@ -71,6 +71,8 @@ import hashlib
 
 from toolkit.util.blended_blur_noise import get_blended_blur_noise
 from toolkit.util.get_model import get_model_class
+from toolkit.metrics_collector import MetricsManager
+from toolkit.dynamic_config import DynamicConfig
 
 def flush():
     torch.cuda.empty_cache()
@@ -244,6 +246,27 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 torch.profiler.ProfilerActivity.CUDA,
             ],
         )
+        
+        # 初始化metrics收集器
+        self.metrics_collector = None
+        try:
+            # 使用job名称作为唯一ID
+            job_id = getattr(self.job, 'name', 'unknown_job')
+            self.metrics_collector = MetricsManager.get_collector(job_id)
+        except Exception as e:
+            print(f"Warning: Failed to initialize metrics collector: {e}")
+            # 继续训练，即使metrics收集器初始化失败
+            
+        # 初始化动态配置管理器
+        self.dynamic_config = None
+        try:
+            job_name = getattr(self.job, 'name', 'unknown_job')
+            # save_root在BaseTrainProcess中定义
+            self.dynamic_config = DynamicConfig(job_name, self.save_root)
+            print(f"Dynamic config initialized. Config file: {self.dynamic_config.get_config_file_path()}")
+        except Exception as e:
+            print(f"Warning: Failed to initialize dynamic config: {e}")
+            # 继续训练，即使动态配置失败
 
     def post_process_generate_image_config_list(self, generate_image_config_list: List[GenerateImageConfig]):
         # override in subclass
@@ -2003,7 +2026,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 # todo improve this logic to send one of each through if we can buckets and batch size might be an issue
                 is_reg_step = False
                 is_save_step = self.save_config.save_every and self.step_num % self.save_config.save_every == 0
-                is_sample_step = self.sample_config.sample_every and self.step_num % self.sample_config.sample_every == 0
+                
+                # 使用动态配置获取采样间隔，每10步检查一次配置文件以避免频繁IO
+                current_sample_every = self.sample_config.sample_every
+                if self.dynamic_config is not None and self.step_num % 10 == 0:
+                    try:
+                        current_sample_every = self.dynamic_config.get_sample_every(self.sample_config.sample_every)
+                        # 如果配置有变化，输出提示信息
+                        if current_sample_every != self.sample_config.sample_every:
+                            print(f"\nDynamic config: sample_every changed from {self.sample_config.sample_every} to {current_sample_every} at step {self.step_num}")
+                    except Exception as e:
+                        print(f"Warning: Failed to get dynamic sample_every: {e}")
+                        current_sample_every = self.sample_config.sample_every
+                
+                is_sample_step = current_sample_every and self.step_num % current_sample_every == 0
                 if self.train_config.disable_sampling:
                     is_sample_step = False
 
@@ -2121,6 +2157,20 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                 if self.progress_bar is not None:
                     self.progress_bar.set_postfix_str(prog_bar_string)
+
+                # 收集训练指标到数据库
+                if self.metrics_collector is not None:
+                    try:
+                        self.metrics_collector.log_step_with_auto_metrics(
+                            step=self.step_num,
+                            loss_dict=loss_dict,
+                            learning_rate=learning_rate,
+                            speed_string=prog_bar_string
+                        )
+                    except Exception as e:
+                        # 不要因为metrics收集失败而中断训练
+                        if self.step_num % 100 == 0:  # 每100步只打印一次错误，避免日志过多
+                            print(f"Warning: Failed to collect metrics at step {self.step_num}: {e}")
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):

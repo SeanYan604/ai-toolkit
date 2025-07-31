@@ -8,11 +8,13 @@ import useJob from '@/hooks/useJob';
 import { startJob, stopJob } from '@/utils/jobs';
 import SampleImages from '@/components/SampleImages';
 import JobOverview from '@/components/JobOverview';
+import LossChart from '@/components/LossChart';
+import DynamicConfigPanel from '@/components/DynamicConfigPanel';
 import { JobConfig } from '@/types';
 import { redirect } from 'next/navigation';
 import JobActionBar from '@/components/JobActionBar';
 
-type PageKey = 'overview' | 'samples';
+type PageKey = 'overview' | 'metrics' | 'settings' | 'samples';
 
 interface Page {
   name: string;
@@ -21,6 +23,8 @@ interface Page {
 
 const pages: Page[] = [
   { name: 'Overview', value: 'overview' },
+  { name: 'Metrics', value: 'metrics' },
+  { name: 'Settings', value: 'settings' },
   { name: 'Samples', value: 'samples' },
 ];
 
@@ -60,6 +64,16 @@ export default function JobPage({ params }: { params: { jobID: string } }) {
         {job && (
           <>
             {pageKey === 'overview' && <JobOverview job={job} />}
+            {pageKey === 'metrics' && (
+              <div className="space-y-6">
+                <LossChart jobId={job.name} height={500} />
+              </div>
+            )}
+            {pageKey === 'settings' && (
+              <div className="space-y-6">
+                <DynamicConfigPanel jobName={job.name} />
+              </div>
+            )}
             {pageKey === 'samples' && <SampleImages job={job} />}
           </>
         )}

@@ -4,7 +4,7 @@ generator client {
 
 datasource db {
   provider = "sqlite"
-  url      = "file:../../aitk_db.db"
+  url      = "file:../aitk_db.db"
 }
 
 model Settings {
@@ -35,4 +35,18 @@ model Queue {
   updated_at DateTime @updatedAt
   status     String   @default("waiting")
   @@index([job_id, channel])
+}
+
+model TrainingMetrics {
+  id          String   @id @default(uuid())
+  job_id      String   // 关联Job表
+  step        Int      // 训练步数
+  timestamp   String   // ISO时间戳字符串
+  metric_type String   // 'loss', 'learning_rate', 'gpu_memory'
+  metric_name String   // 'loss/total', 'loss/img', 'lr'
+  value       Float    // 具体数值
+  
+  @@index([job_id, step])
+  @@index([job_id, metric_type, metric_name])
+  @@unique([job_id, step, metric_type, metric_name])
 }
