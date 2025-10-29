@@ -914,6 +914,7 @@ class ControlFileItemDTOMixin:
                 img = img.resize((512, 512), Image.BICUBIC)
 
             elif not self.use_raw_control_images:
+                # 标准模型：经过 bucket 处理
                 w, h = img.size
                 if self.flip_x:
                     # do a flip
@@ -935,6 +936,34 @@ class ControlFileItemDTOMixin:
                     ))
                 else:
                     raise Exception("Control images not supported for non-bucket datasets")
+            else:
+                # use_raw_control_images=True (Qwen 等模型)
+                # 检查是否需要对齐到 target 尺寸（通过 model_config.match_target_res）
+                sd = self.dataset_config.__dict__.get('sd', None) if hasattr(self.dataset_config, '__dict__') else None
+                should_match_target = False
+
+                # 从 sd.model_config.model_kwargs 获取 match_target_res 配置
+                if sd is not None and hasattr(sd, 'model_config'):
+                    model_kwargs = getattr(sd.model_config, 'model_kwargs', {})
+                    should_match_target = model_kwargs.get('match_target_res', False)
+
+                if should_match_target and self.dataset_config.buckets:
+                    # match_target_res=True: 强制经过 bucket 处理，与 target 完全对齐
+                    w, h = img.size
+                    if self.flip_x:
+                        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                    if self.flip_y:
+                        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+
+                    # 使用与 target 完全相同的 bucket 参数
+                    img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
+                    img = img.crop((
+                        self.crop_x,
+                        self.crop_y,
+                        self.crop_x + self.crop_width,
+                        self.crop_y + self.crop_height
+                    ))
+                # else: 保持原始尺寸（默认行为）
             transform = transforms.Compose([
                 transforms.ToTensor(),
             ])
@@ -946,13 +975,27 @@ class ControlFileItemDTOMixin:
             
         if len(control_tensors) == 0:
             self.control_tensor = None
+            self.control_tensor_list = None
         elif len(control_tensors) == 1:
             self.control_tensor = control_tensors[0]
+            # 重要：如果是 Qwen 等模型，也需要设置 list 格式
+            # 因为 Qwen 的文本编码和 forward pass 都依赖 control_tensor_list
+            if self.use_raw_control_images:
+                self.control_tensor_list = control_tensors  # [tensor1]
+            else:
+                self.control_tensor_list = None
         elif self.use_raw_control_images:
-            # just send the list of tensors as their shapes wont match
+            # 多个控制图像：尝试 stack，如果尺寸一致（match_target_res=True）则可以成功
+            try:
+                self.control_tensor = torch.stack(control_tensors, dim=0)
+            except RuntimeError:
+                # 尺寸不一致，无法 stack
+                self.control_tensor = None
+            # 总是设置 list 格式供 Qwen 等模型使用
             self.control_tensor_list = control_tensors
         else:
             self.control_tensor = torch.stack(control_tensors, dim=0)
+            self.control_tensor_list = None
 
     def cleanup_control(self: 'FileItemDTO'):
         self.control_tensor = None
