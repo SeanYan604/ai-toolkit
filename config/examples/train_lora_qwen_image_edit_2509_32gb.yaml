@@ -58,7 +58,7 @@ config:
         dtype: bf16
       model:
         # huggingface model name or path
-        name_or_path: "Qwen/Qwen-Image-Edit-2509"
+        name_or_path: "/root/autodl-tmp/pretrained_models/Qwen/Qwen-Image-Edit-2509"
         arch: "qwen_image_edit_plus"
         quantize: true
         # to use the ARA use the | pipe to point to hf path, or a local path if you have one.
