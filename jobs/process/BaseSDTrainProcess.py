@@ -1519,6 +1519,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
+        
+        # 🔍 性能检测开关
+        performance_log_every = self.get_conf('performance_log_every', 0)
+        enable_perf_logging = performance_log_every > 0
+        
         params = []
 
         ### HOOK ###
@@ -2171,7 +2176,11 @@ class BaseSDTrainProcess(BaseTrainProcess):
             loss_dict = None
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
+                    if enable_perf_logging:
+                        self.timer.start('train_step')
                     loss_dict = self.hook_train_loop(batch_list)
+                    if enable_perf_logging:
+                        self.timer.stop('train_step')
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
@@ -2233,6 +2242,44 @@ class BaseSDTrainProcess(BaseTrainProcess):
 
                     if self.progress_bar is not None:
                         self.progress_bar.set_postfix_str(prog_bar_string)
+
+                # 🔍 定期打印性能统计
+                if enable_perf_logging and self.step_num % performance_log_every == 0 and self.step_num > 0:
+                    print("\n" + "="*70)
+                    print(f"⏱️  Performance @ Step {self.step_num}")
+                    print("="*70)
+                    
+                    key_timers = ['get_batch', 'train_step', 'predict_unet', 'backward', 'optimizer_step']
+                    total_time = 0
+                    stats = {}
+                    
+                    for name in key_timers:
+                        if name in self.timer.timers and len(self.timer.timers[name]) > 0:
+                            times = list(self.timer.timers[name])
+                            avg = sum(times) / len(times)
+                            stats[name] = avg
+                            total_time += avg
+                    
+                    for name in key_timers:
+                        if name in stats:
+                            avg_ms = stats[name] * 1000
+                            pct = (stats[name] / total_time * 100) if total_time > 0 else 0
+                            marker = "🟢" if pct < 20 else "🟡" if pct < 40 else "🔴"
+                            print(f"  {marker} {name:20s}: {avg_ms:7.1f}ms  ({pct:5.1f}%)")
+                    
+                    if total_time > 0:
+                        print(f"\n  Total/step: {total_time*1000:.1f}ms  |  {1/total_time:.2f} steps/sec")
+                        
+                        if 'get_batch' in stats and stats['get_batch'] / total_time > 0.3:
+                            print(f"  ⚠️  Data loading slow (>30%)! → Increase num_workers")
+                        
+                        gpu_time = stats.get('predict_unet', 0) + stats.get('backward', 0)
+                        if 'train_step' in stats:
+                            gpu_util = (gpu_time / stats['train_step'] * 100)
+                            print(f"  GPU Util: ~{gpu_util:.0f}%", end="")
+                            print(" ⚠️  Low!" if gpu_util < 50 else " ✅")
+                    
+                    print("="*70 + "\n")
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
                 if isinstance(batch, DataLoaderBatchDTO):
