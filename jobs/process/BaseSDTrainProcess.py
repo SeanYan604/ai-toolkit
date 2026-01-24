@@ -2249,23 +2249,39 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     print(f"⏱️  Performance @ Step {self.step_num}")
                     print("="*70)
                     
-                    key_timers = ['get_batch', 'train_step', 'predict_unet', 'backward', 'optimizer_step']
-                    total_time = 0
-                    stats = {}
+                    # 顶层timer：不包含子timer
+                    top_level_timers = ['get_batch', 'train_step']
+                    # 详细timer：train_step的子项
+                    detail_timers = ['predict_unet', 'backward', 'optimizer_step']
+                    all_timers = top_level_timers + detail_timers
                     
-                    for name in key_timers:
+                    stats = {}
+                    for name in all_timers:
                         if name in self.timer.timers and len(self.timer.timers[name]) > 0:
                             times = list(self.timer.timers[name])
                             avg = sum(times) / len(times)
                             stats[name] = avg
-                            total_time += avg
                     
-                    for name in key_timers:
+                    # 计算实际总耗时（只统计顶层timer）
+                    total_time = sum(stats.get(name, 0) for name in top_level_timers)
+                    
+                    # 打印顶层统计
+                    for name in top_level_timers:
                         if name in stats:
                             avg_ms = stats[name] * 1000
                             pct = (stats[name] / total_time * 100) if total_time > 0 else 0
                             marker = "🟢" if pct < 20 else "🟡" if pct < 40 else "🔴"
                             print(f"  {marker} {name:20s}: {avg_ms:7.1f}ms  ({pct:5.1f}%)")
+                    
+                    # 打印train_step的详细分解（缩进显示）
+                    if 'train_step' in stats and any(name in stats for name in detail_timers):
+                        print(f"\n  train_step breakdown:")
+                        train_step_time = stats['train_step']
+                        for name in detail_timers:
+                            if name in stats:
+                                avg_ms = stats[name] * 1000
+                                pct = (stats[name] / train_step_time * 100) if train_step_time > 0 else 0
+                                print(f"    ├─ {name:18s}: {avg_ms:7.1f}ms  ({pct:5.1f}%)")
                     
                     if total_time > 0:
                         print(f"\n  Total/step: {total_time*1000:.1f}ms  |  {1/total_time:.2f} steps/sec")
@@ -2273,8 +2289,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if 'get_batch' in stats and stats['get_batch'] / total_time > 0.3:
                             print(f"  ⚠️  Data loading slow (>30%)! → Increase num_workers")
                         
-                        gpu_time = stats.get('predict_unet', 0) + stats.get('backward', 0)
                         if 'train_step' in stats:
+                            gpu_time = stats.get('predict_unet', 0) + stats.get('backward', 0)
                             gpu_util = (gpu_time / stats['train_step'] * 100)
                             print(f"  GPU Util: ~{gpu_util:.0f}%", end="")
                             print(" ⚠️  Low!" if gpu_util < 50 else " ✅")
