@@ -189,6 +189,13 @@ class Flux2Model(BaseModel):
         if os.path.exists(os.path.join(model_path, FLUX2_VAE_FILENAME)):
             vae_path = os.path.join(model_path, FLUX2_VAE_FILENAME)
 
+        # Also check for diffusers-format VAE in model directory
+        # (e.g. flux2_klein_base_9b/vae/diffusion_pytorch_model.safetensors)
+        if vae_path is None:
+            diffusers_vae = os.path.join(model_path, "vae", "diffusion_pytorch_model.safetensors")
+            if os.path.exists(diffusers_vae):
+                vae_path = diffusers_vae
+
         if vae_path is None:
             vae_path = self.flux2_vae_path
 
