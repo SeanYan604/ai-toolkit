@@ -134,8 +134,10 @@ class Wan2214bI2VModel(Wan2214bModel):
                 vae=self.vae
             )
         
+        # clone tensors from no_grad block to avoid "Inference tensors cannot
+        # be saved for backward" errors with gradient checkpointing
         noise_pred = self.model(
-            hidden_states=conditioned_latent,
+            hidden_states=conditioned_latent.clone(),
             timestep=timestep,
             encoder_hidden_states=text_embeddings.text_embeds,
             return_dict=False,

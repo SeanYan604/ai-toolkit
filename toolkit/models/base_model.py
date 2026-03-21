@@ -934,8 +934,11 @@ class BaseModel:
             
         # check if get_noise prediction has guidance_embedding_scale
         # if it does not, we dont pass it
-        signatures =  inspect.signature(self.get_noise_prediction).parameters
-        
+        # cache the signature inspection to avoid repeated introspection overhead
+        if not hasattr(self, '_noise_pred_signatures'):
+            self._noise_pred_signatures = inspect.signature(self.get_noise_prediction).parameters
+        signatures = self._noise_pred_signatures
+
         if 'guidance_embedding_scale' in signatures:
             kwargs['guidance_embedding_scale'] = guidance_embedding_scale
         if 'bypass_guidance_embedding' in signatures:

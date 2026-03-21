@@ -909,12 +909,14 @@ class LTX2Model(BaseModel):
                 audio_latents.shape[0], audio_num_frames, audio_latents.device
             )
 
+        # clone tensors from no_grad block to avoid "Inference tensors cannot
+        # be saved for backward" errors with gradient checkpointing
         noise_pred_video, noise_pred_audio = self.transformer(
-            hidden_states=packed_latents,
-            audio_hidden_states=audio_latents.to(self.transformer.dtype),
-            encoder_hidden_states=connector_prompt_embeds,
-            audio_encoder_hidden_states=connector_audio_prompt_embeds,
-            timestep=video_timestep,
+            hidden_states=packed_latents.clone(),
+            audio_hidden_states=audio_latents.to(self.transformer.dtype).clone(),
+            encoder_hidden_states=connector_prompt_embeds.clone() if connector_prompt_embeds is not None else None,
+            audio_encoder_hidden_states=connector_audio_prompt_embeds.clone() if connector_audio_prompt_embeds is not None else None,
+            timestep=video_timestep.clone() if video_timestep is not None else None,
             audio_timestep=timestep,
             encoder_attention_mask=connector_attention_mask,
             audio_encoder_attention_mask=connector_attention_mask,
@@ -923,8 +925,8 @@ class LTX2Model(BaseModel):
             width=latent_width,
             fps=frame_rate,
             audio_num_frames=audio_num_frames,
-            video_coords=video_coords,
-            audio_coords=audio_coords,
+            video_coords=video_coords.clone() if video_coords is not None else None,
+            audio_coords=audio_coords.clone() if audio_coords is not None else None,
             # rope_interpolation_scale=rope_interpolation_scale,
             attention_kwargs=None,
             return_dict=False,

@@ -542,13 +542,15 @@ class Flux2Model(BaseModel):
 
             cast_dtype = self.model.dtype
 
+        # clone tensors created inside torch.no_grad() to make them regular
+        # tensors, otherwise gradient checkpointing cannot save them for backward
         packed_noise_pred = self.transformer(
-            x=img_input.to(self.device_torch, cast_dtype),
-            x_ids=img_input_ids.to(self.device_torch),
+            x=img_input.to(self.device_torch, cast_dtype).clone(),
+            x_ids=img_input_ids.to(self.device_torch).clone(),
             timesteps=timestep.to(self.device_torch, cast_dtype) / 1000,
-            ctx=txt.to(self.device_torch, cast_dtype),
-            ctx_ids=txt_ids.to(self.device_torch),
-            guidance=guidance_vec.to(self.device_torch, cast_dtype),
+            ctx=txt.to(self.device_torch, cast_dtype).clone(),
+            ctx_ids=txt_ids.to(self.device_torch).clone(),
+            guidance=guidance_vec.to(self.device_torch, cast_dtype).clone(),
         )
 
         if img_cond_seq is not None:

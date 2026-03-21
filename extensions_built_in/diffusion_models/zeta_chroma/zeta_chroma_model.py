@@ -308,14 +308,16 @@ class ZetaChromaModel(BaseModel):
         #     t_vec,
         #     text_embeddings.text_embeds,
         # )[0]
+        # clone tensors from no_grad block to avoid "Inference tensors cannot
+        # be saved for backward" errors with gradient checkpointing
         pred = self.transformer(
-            img=img, #(1, 1024, 3072)
-            img_ids=image_pos_ids, # (1, 1024, 3)
-            img_mask=img_mask, # (1, 1024)
+            img=img.clone(), #(1, 1024, 3072)
+            img_ids=image_pos_ids.clone(), # (1, 1024, 3)
+            img_mask=img_mask.clone(), # (1, 1024)
             txt=text_embeddings.text_embeds, # (1, 512, 2560)
-            txt_ids=pos_text_ids, # (1, 512, 3)
+            txt_ids=pos_text_ids.clone(), # (1, 512, 3)
             txt_mask=text_embeddings.attention_mask, # (1, 512)
-            timesteps=t_vec, # (1,)
+            timesteps=t_vec.clone(), # (1,)
         )
         
         pred = vae_unflatten(pred.float(), pixel_shape, patch_size=self.patch_size)

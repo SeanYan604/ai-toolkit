@@ -346,15 +346,17 @@ class ChromaModel(BaseModel):
 
         cast_dtype = self.unet.dtype
 
+        # clone tensors from no_grad block to avoid "Inference tensors cannot
+        # be saved for backward" errors with gradient checkpointing
         noise_pred = self.unet(
             img=latent_model_input_packed.to(
                 self.device_torch, cast_dtype
-            ),
-            img_ids=img_ids,
+            ).clone(),
+            img_ids=img_ids.clone(),
             txt=text_embeddings.text_embeds.to(
                 self.device_torch, cast_dtype
-            ),
-            txt_ids=txt_ids,
+            ).clone(),
+            txt_ids=txt_ids.clone(),
             txt_mask=text_embeddings.attention_mask.to(
                 self.device_torch, cast_dtype
             ),

@@ -280,9 +280,11 @@ class Wan225bModel(Wan21):
                     out_t_chunks.append(temp_ts)
                 timestep = torch.cat(out_t_chunks, dim=0)
 
+        # clone tensors from no_grad block to avoid "Inference tensors cannot
+        # be saved for backward" errors with gradient checkpointing
         noise_pred = self.model(
-            hidden_states=conditioned_latent,
-            timestep=timestep,
+            hidden_states=conditioned_latent.clone(),
+            timestep=timestep.clone(),
             encoder_hidden_states=text_embeddings.text_embeds,
             return_dict=False,
             **kwargs,

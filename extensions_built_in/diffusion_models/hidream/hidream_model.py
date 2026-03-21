@@ -373,13 +373,15 @@ class HidreamModel(BaseModel):
         # run the to for the list
         text_embeds = [te.to(device, dtype=dtype) for te in text_embeds]
         
+        # clone tensors from no_grad block to avoid "Inference tensors cannot
+        # be saved for backward" errors with gradient checkpointing
         noise_pred = self.transformer(
             hidden_states = latent_model_input,
             timesteps = timestep,
             encoder_hidden_states = text_embeds,
             pooled_embeds = text_embeddings.pooled_embeds.to(device, dtype=dtype),
-            img_sizes = img_sizes,
-            img_ids = img_ids,
+            img_sizes = img_sizes.clone() if img_sizes is not None else None,
+            img_ids = img_ids.clone() if img_ids is not None else None,
             return_dict = False,
         )[0]
         noise_pred = -noise_pred
