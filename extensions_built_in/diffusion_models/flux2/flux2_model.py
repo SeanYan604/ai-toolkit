@@ -530,8 +530,8 @@ class Flux2Model(BaseModel):
                 assert img_cond_seq_ids is not None, (
                     "You need to provide either both or neither of the sequence conditioning"
                 )
-                img_input = torch.cat((img_input, img_cond_seq), dim=1)
-                img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids), dim=1)
+                img_input = torch.cat((img_input, img_cond_seq.to(self.device_torch)), dim=1)
+                img_input_ids = torch.cat((img_input_ids, img_cond_seq_ids.to(self.device_torch)), dim=1)
 
             guidance_vec = torch.full(
                 (img_input.shape[0],),
