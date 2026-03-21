@@ -717,6 +717,7 @@ export const modelArchs: ModelArch[] = [
       'config.process[0].model.model_kwargs': [
         {
           match_target_res: false,
+          te_path: '/root/autodl-fs/pretrained_models/qwen3_8b',
         },
         {},
       ],
