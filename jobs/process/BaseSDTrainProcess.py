@@ -4,6 +4,8 @@ import inspect
 import json
 import random
 import shutil
+import sys
+import time
 from collections import OrderedDict
 import os
 import re
@@ -61,6 +63,7 @@ from tqdm import tqdm
 from toolkit.config_modules import SaveConfig, LoggingConfig, SampleConfig, NetworkConfig, TrainConfig, ModelConfig, \
     GenerateImageConfig, EmbeddingConfig, DatasetConfig, preprocess_dataset_raw_config, AdapterConfig, GuidanceConfig, validate_configs, \
     DecoratorConfig
+from toolkit.timer import PhaseTimer
 from toolkit.logging_aitk import create_logger
 from diffusers import FluxTransformer2DModel
 from toolkit.accelerator import get_accelerator, unwrap_model
@@ -363,11 +366,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # let adapter know we are sampling
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = True
-        
-        # send to be generated
-        self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
 
-        
+        # send to be generated
+        _sample_start = time.time()
+        print_acc(f"Starting sample generation ({len(gen_img_config_list)} images)...")
+        try:
+            self.sd.generate_images(gen_img_config_list, sampler=sample_config.sampler)
+            print_acc(f"Sample generation completed in {time.time()-_sample_start:.1f}s")
+        except Exception as e:
+            print_acc(f"WARNING: Sample generation failed after {time.time()-_sample_start:.1f}s: {e}")
+            traceback.print_exc()
+
+
         if self.adapter is not None and isinstance(self.adapter, CustomAdapter):
             self.adapter.is_sampling = False
 
@@ -1561,15 +1571,19 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # torch.autograd.set_detect_anomaly(True)
         # run base process run
         BaseTrainProcess.run(self)
-        
+
+        # Phase timer for tracking overall training pipeline stages
+        self.phase_timer = PhaseTimer()
+
         # 🔍 性能检测开关
         performance_log_every = self.get_conf('performance_log_every', 0)
         enable_perf_logging = performance_log_every > 0
-        
+
         params = []
 
         ### HOOK ###
         self.hook_before_model_load()
+        self.phase_timer.start('model_loading')
         model_config_to_load = copy.deepcopy(self.model_config)
 
         if self.is_fine_tuning or self.train_config.merge_network_on_save:
@@ -1622,7 +1636,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.hook_after_sd_init_before_load()
         # run base sd process run
         self.sd.load_model()
-        
+        self.phase_timer.stop('model_loading')
+        print_acc(f"[phase] model_loading took {self.phase_timer.phases['model_loading']['duration']:.1f}s")
+
         # compile the model if needed
         if self.model_config.compile:
             try:
@@ -2048,6 +2064,7 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.lr_scheduler = lr_scheduler
 
         ### HOOk ###
+        self.phase_timer.start('dataset_loading')
         self.before_dataset_load()
         # load datasets if passed in the root process
         if self.datasets is not None:
@@ -2055,12 +2072,18 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.datasets_reg is not None:
             self.data_loader_reg = get_dataloader_from_datasets(self.datasets_reg, self.train_config.batch_size,
                                                                 self.sd)
+        self.phase_timer.stop('dataset_loading')
+        print_acc(f"[phase] dataset_loading took {self.phase_timer.phases['dataset_loading']['duration']:.1f}s")
 
         flush()
         self.last_save_step = self.step_num
         ### HOOK ###
+        self.phase_timer.start('pre_train_setup')
         self.hook_before_train_loop()
+        self.phase_timer.stop('pre_train_setup')
+        print_acc(f"[phase] pre_train_setup took {self.phase_timer.phases['pre_train_setup']['duration']:.1f}s")
 
+        self.phase_timer.start('first_sample')
         if self.has_first_sample_requested and self.step_num <= 1 and not self.train_config.disable_sampling:
             print_acc("Generating first sample from first sample config")
             self.sample(0, is_first=True)
@@ -2071,7 +2094,10 @@ class BaseSDTrainProcess(BaseTrainProcess):
         elif self.step_num <= 1 or self.train_config.force_first_sample:
             print_acc("Generating baseline samples before training")
             self.sample(self.step_num)
+        self.phase_timer.stop('first_sample')
+        print_acc(f"[phase] first_sample took {self.phase_timer.phases['first_sample']['duration']:.1f}s")
         
+        print_acc("[train] setting up progress bar and dataloaders...")
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
                 total=self.train_config.steps,
@@ -2101,27 +2127,37 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
+        print_acc("[train] setting train device state...")
+        _t0 = time.time()
         self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()
+        print_acc(f"[train] train device state set in {time.time()-_t0:.1f}s")
         # self.step_num = 0
 
         # print_acc(f"Compiling Model")
         # torch.compile(self.sd.unet, dynamic=True)
 
         # make sure all params require grad
+        print_acc("[train] ensuring params requires grad...")
+        sys.stdout.flush()
         self.ensure_params_requires_grad(force=True)
+        print_acc("[train] params requires grad set")
+        sys.stdout.flush()
 
 
         ###################################################################
         # TRAIN LOOP
         ###################################################################
 
-
+        self.phase_timer.start('training_loop')
+        self._training_start_time = time.time()
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
+        print_acc(f"[train] entering training loop, start_step={start_step_num}, total_steps={self.train_config.steps}")
+        sys.stdout.flush()
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -2173,8 +2209,14 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         is_reg_step = True
                     elif dataloader is not None:
                         try:
+                            if step == start_step_num and b == 0:
+                                print_acc("[train] fetching first batch...")
+                                sys.stdout.flush()
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
+                            if step == start_step_num and b == 0:
+                                print_acc("[train] first batch fetched")
+                                sys.stdout.flush()
                         except StopIteration:
                             with self.timer('reset_batch'):
                                 # hit the end of an epoch, reset
@@ -2216,6 +2258,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.torch_profiler.start()
             did_oom = False
             loss_dict = None
+            if step == start_step_num:
+                print_acc(f"[train] starting first training step (step={step})...")
+                sys.stdout.flush()
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     if enable_perf_logging:
@@ -2223,6 +2268,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     loss_dict = self.hook_train_loop(batch_list)
                     if enable_perf_logging:
                         self.timer.stop('train_step')
+                if step == start_step_num:
+                    print_acc(f"[train] first training step completed")
+                    sys.stdout.flush()
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:
@@ -2327,16 +2375,26 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     
                     if total_time > 0:
                         print(f"\n  Total/step: {total_time*1000:.1f}ms  |  {1/total_time:.2f} steps/sec")
-                        
+
                         if 'get_batch' in stats and stats['get_batch'] / total_time > 0.3:
                             print(f"  ⚠️  Data loading slow (>30%)! → Increase num_workers")
-                        
+
                         if 'train_step' in stats:
                             gpu_time = stats.get('predict_unet', 0) + stats.get('backward', 0)
                             gpu_util = (gpu_time / stats['train_step'] * 100)
                             print(f"  GPU Util: ~{gpu_util:.0f}%", end="")
                             print(" ⚠️  Low!" if gpu_util < 50 else " ✅")
-                    
+
+                    # Overall throughput and ETA
+                    _elapsed = time.time() - self._training_start_time
+                    _steps_done = self.step_num - start_step_num
+                    if _steps_done > 0 and _elapsed > 0:
+                        _overall_sps = _steps_done / _elapsed
+                        _remaining = self.train_config.steps - self.step_num
+                        _eta_sec = _remaining / _overall_sps if _overall_sps > 0 else 0
+                        print(f"\n  Overall: {_steps_done} steps in {_elapsed:.0f}s ({_overall_sps:.2f} steps/sec)")
+                        print(f"  ETA: {_eta_sec/60:.1f}min ({_remaining} steps remaining)")
+
                     print("="*70 + "\n")
 
                 # if the batch is a DataLoaderBatchDTO, then we need to clean it up
@@ -2355,7 +2413,9 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         if self.progress_bar is not None:
                             self.progress_bar.pause()
                         print_acc(f"\nSaving at step {self.step_num}")
+                        _t_save = time.time()
                         self.save(self.step_num)
+                        print_acc(f"[timing] save took {time.time()-_t_save:.1f}s")
                         self.ensure_params_requires_grad()
                         # clear any grads
                         optimizer.zero_grad()
@@ -2448,6 +2508,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         ###################################################################
         ##  END TRAIN LOOP
         ###################################################################
+        self.phase_timer.stop('training_loop')
+        print_acc(f"[phase] training_loop took {self.phase_timer.phases['training_loop']['duration']:.1f}s")
         self.accelerator.wait_for_everyone()
         if self.progress_bar is not None:
             self.progress_bar.close()
@@ -2482,6 +2544,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
         )
 
         flush()
+        if self.accelerator.is_main_process:
+            self.phase_timer.print_summary()
         self.done_hook()
 
     def push_to_hub(

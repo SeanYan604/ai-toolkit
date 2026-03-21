@@ -4,6 +4,7 @@ import inspect
 import json
 import random
 import shutil
+import time
 import typing
 from typing import Optional, Union, List, Literal
 import os
@@ -361,7 +362,7 @@ class BaseModel:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate_images(
             self,
             image_configs: List[GenerateImageConfig],
@@ -404,18 +405,23 @@ class BaseModel:
             network = BlankNetwork()
 
         self.save_device_state()
+        _t0 = time.time()
         self.set_device_state_preset('generate')
+        _gpu_mem = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+        print_acc(f"[generate] set_device_state('generate') took {time.time()-_t0:.1f}s, GPU mem: {_gpu_mem:.1f}GB")
 
         # save current seed state for training
         rng_state = torch.get_rng_state()
         cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
 
         if pipeline is None:
+            _t0 = time.time()
             pipeline = self.get_generation_pipeline()
+            print_acc(f"[generate] get_generation_pipeline() took {time.time()-_t0:.1f}s")
             try:
                 pipeline.set_progress_bar_config(disable=True)
-            except:
-                pass
+            except Exception as e:
+                print_acc(f"[generate] Warning: could not disable progress bar: {e}")
 
         start_multiplier = 1.0
         if network is not None:
@@ -424,7 +430,8 @@ class BaseModel:
         # pipeline.to(self.device_torch)
 
         with network:
-            with torch.no_grad():
+            # already under @torch.inference_mode()
+            if True:
                 if network is not None:
                     assert network.is_active
 
@@ -510,6 +517,7 @@ class BaseModel:
                             quad_count=4
                         )
 
+                    _t_enc = time.time()
                     if self.sample_prompts_cache is not None:
                         conditional_embeds = self.sample_prompts_cache[i]['conditional'].to(self.device_torch, dtype=self.torch_dtype)
                         unconditional_embeds = self.sample_prompts_cache[i]['unconditional'].to(self.device_torch, dtype=self.torch_dtype)
@@ -650,7 +658,9 @@ class BaseModel:
                         self.device_torch, dtype=self.unet.dtype)
                     unconditional_embeds = unconditional_embeds.to(
                         self.device_torch, dtype=self.unet.dtype)
+                    print_acc(f"[generate] prompt encoding took {time.time()-_t_enc:.1f}s")
 
+                    _t_img = time.time()
                     img = self.generate_single_image(
                         pipeline,
                         gen_config,
@@ -659,6 +669,7 @@ class BaseModel:
                         generator,
                         extra,
                     )
+                    print_acc(f"[generate] image {i+1}/{len(image_configs)} took {time.time()-_t_img:.1f}s")
 
                     gen_config.save_image(img, i)
                     gen_config.log_image(img, i)
@@ -677,14 +688,23 @@ class BaseModel:
         if cuda_rng_state is not None:
             torch.cuda.set_rng_state(cuda_rng_state)
 
+        _t0 = time.time()
+        print_acc("[generate] restoring device state...")
         self.restore_device_state()
         if network is not None:
             network.train()
             network.multiplier = start_multiplier
 
-        self.unet.to(self.device_torch, dtype=self.torch_dtype)
+        if self.unet.device != self.device_torch:
+            try:
+                self.unet.to(self.device_torch)
+            except Exception as e:
+                pass
+        if self.unet.dtype != self.torch_dtype:
+            self.unet = self.unet.to(dtype=self.torch_dtype)
         if network.is_merged_in:
             network.merge_out(merge_multiplier)
+        print_acc(f"[generate] device state restored in {time.time()-_t0:.1f}s")
         # self.tokenizer.to(original_device_dict['tokenizer'])
 
         # refuse loras
@@ -1443,6 +1463,20 @@ class BaseModel:
         self.set_device_state(self.device_state)
         self.device_state = None
 
+    @staticmethod
+    def _safe_requires_grad(module, requires_grad: bool):
+        """Safely set requires_grad, handling quantized parameters that may not support it."""
+        try:
+            module.requires_grad_(requires_grad)
+        except Exception:
+            # Quantized parameters (e.g. quanto QBytesTensor) may not support requires_grad_.
+            # Fall back to setting per-parameter with error handling.
+            for param in module.parameters():
+                try:
+                    param.requires_grad_(requires_grad)
+                except Exception:
+                    pass
+
     def set_device_state(self, state):
         if state['vae']['training']:
             self.vae.train()
@@ -1453,11 +1487,12 @@ class BaseModel:
             self.unet.train()
         else:
             self.unet.eval()
-        self.unet.to(state['unet']['device'])
-        if state['unet']['requires_grad']:
-            self.unet.requires_grad_(True)
-        else:
-            self.unet.requires_grad_(False)
+        if self.unet.device != state['unet']['device']:
+            try:
+                self.unet.to(state['unet']['device'])
+            except Exception:
+                pass
+        self._safe_requires_grad(self.unet, state['unet']['requires_grad'])
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):
                 if isinstance(state['text_encoder'], list):
@@ -1465,25 +1500,37 @@ class BaseModel:
                         encoder.train()
                     else:
                         encoder.eval()
-                    encoder.to(state['text_encoder'][i]['device'])
-                    encoder.requires_grad_(
-                        state['text_encoder'][i]['requires_grad'])
+                    if encoder.device != state['text_encoder'][i]['device']:
+                        try:
+                            encoder.to(state['text_encoder'][i]['device'])
+                        except Exception:
+                            pass
+                    self._safe_requires_grad(
+                        encoder, state['text_encoder'][i]['requires_grad'])
                 else:
                     if state['text_encoder']['training']:
                         encoder.train()
                     else:
                         encoder.eval()
-                    encoder.to(state['text_encoder']['device'])
-                    encoder.requires_grad_(
-                        state['text_encoder']['requires_grad'])
+                    if encoder.device != state['text_encoder']['device']:
+                        try:
+                            encoder.to(state['text_encoder']['device'])
+                        except Exception:
+                            pass
+                    self._safe_requires_grad(
+                        encoder, state['text_encoder']['requires_grad'])
         else:
             if state['text_encoder']['training']:
                 self.text_encoder.train()
             else:
                 self.text_encoder.eval()
-            self.text_encoder.to(state['text_encoder']['device'])
-            self.text_encoder.requires_grad_(
-                state['text_encoder']['requires_grad'])
+            if self.text_encoder.device != state['text_encoder']['device']:
+                try:
+                    self.text_encoder.to(state['text_encoder']['device'])
+                except Exception:
+                    pass
+            self._safe_requires_grad(
+                self.text_encoder, state['text_encoder']['requires_grad'])
 
         if self.adapter is not None:
             self.adapter.to(state['adapter']['device'])

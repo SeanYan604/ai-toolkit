@@ -99,7 +99,13 @@ def main():
             job.cleanup()
             jobs_completed += 1
         except Exception as e:
+            sys.stdout.flush()
+            sys.stderr.flush()
             print_acc(f"Error running job: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
             jobs_failed += 1
             try:
                 job.process[0].on_error(e)

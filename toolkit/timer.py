@@ -79,3 +79,49 @@ class Timer:
         else:
             # There was an exception, cancel the timer
             self.cancel(self.current_timer)
+
+
+class PhaseTimer:
+    """Records wall-clock durations for one-shot training phases."""
+
+    def __init__(self):
+        self.phases = OrderedDict()
+        self._active = None
+
+    def start(self, name):
+        self._active = name
+        self.phases[name] = {'start': time.time(), 'end': None, 'duration': None}
+
+    def stop(self, name=None):
+        name = name or self._active
+        if name and name in self.phases and self.phases[name]['end'] is None:
+            self.phases[name]['end'] = time.time()
+            self.phases[name]['duration'] = self.phases[name]['end'] - self.phases[name]['start']
+        self._active = None
+
+    def __call__(self, name):
+        self._active = name
+        return self
+
+    def __enter__(self):
+        self.start(self._active)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop()
+
+    def print_summary(self):
+        total = sum(p['duration'] for p in self.phases.values() if p['duration'] is not None)
+        print("\n" + "=" * 70)
+        print("  Training Phase Summary")
+        print("=" * 70)
+        for name, data in self.phases.items():
+            if data['duration'] is not None:
+                dur = data['duration']
+                pct = (dur / total * 100) if total > 0 else 0
+                if dur >= 60:
+                    print(f"  {name:30s}: {dur:8.1f}s ({dur/60:.1f}min)  ({pct:5.1f}%)")
+                else:
+                    print(f"  {name:30s}: {dur:8.1f}s            ({pct:5.1f}%)")
+        print(f"  {'TOTAL':30s}: {total:8.1f}s ({total/60:.1f}min)")
+        print("=" * 70 + "\n")

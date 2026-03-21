@@ -1221,10 +1221,16 @@ class SDTrainer(BaseSDTrainProcess):
             if isinstance(self.sd.text_encoder, list):
                 for encoder in self.sd.text_encoder:
                     if encoder.dtype != self.sd.te_torch_dtype:
-                        encoder.to(self.sd.te_torch_dtype)
+                        try:
+                            encoder.to(dtype=self.sd.te_torch_dtype)
+                        except Exception:
+                            pass  # quantized TE may not support dtype conversion
             else:
                 if self.sd.text_encoder.dtype != self.sd.te_torch_dtype:
-                    self.sd.text_encoder.to(self.sd.te_torch_dtype)
+                    try:
+                        self.sd.text_encoder.to(dtype=self.sd.te_torch_dtype)
+                    except Exception:
+                        pass  # quantized TE may not support dtype conversion
 
             noisy_latents, noise, timesteps, conditioned_prompts, imgs = self.process_general_training_batch(batch)
             if self.train_config.do_cfg or self.train_config.do_random_cfg:

@@ -1,3 +1,4 @@
+import time
 from typing import List, Optional, Union
 
 import numpy as np
@@ -278,7 +279,7 @@ class Flux2Pipeline(DiffusionPipeline):
     def interrupt(self):
         return self._interrupt
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,
@@ -322,7 +323,7 @@ class Flux2Pipeline(DiffusionPipeline):
         device = self._execution_device
 
         # 3. Encode the prompt
-
+        _t_enc = time.time()
         prompt_embeds, _ = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
@@ -346,8 +347,15 @@ class Flux2Pipeline(DiffusionPipeline):
             )
 
             neg_txt, neg_txt_ids = batched_prc_txt(negative_prompt_embeds)
+        print(f"[pipeline] prompt encoding took {time.time()-_t_enc:.1f}s")
 
-        # 4. Prepare latent variables\
+        # Offload text encoder to CPU to free VRAM for denoising
+        if hasattr(self.text_encoder, 'to'):
+            self.text_encoder.to('cpu')
+            torch.cuda.empty_cache()
+            print(f"[pipeline] text encoder offloaded to CPU, GPU mem: {torch.cuda.memory_allocated()/(1024**3):.1f}GB")
+
+        # 4. Prepare latent variables
         latents = self.prepare_latents(
             batch_size * num_images_per_prompt,
             self.num_channels_latents,
@@ -373,13 +381,16 @@ class Flux2Pipeline(DiffusionPipeline):
         )
 
         if control_img_list is not None and len(control_img_list) > 0:
+            _t_ctrl = time.time()
             img_cond_seq, img_cond_seq_ids = encode_image_refs(
                 self.vae, control_img_list
             )
+            print(f"[pipeline] encode_image_refs ({len(control_img_list)} images) took {time.time()-_t_ctrl:.1f}s")
         else:
             img_cond_seq, img_cond_seq_ids = None, None
 
         # 6. Denoising loop
+        _t_denoise = time.time()
         i = 0
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
@@ -429,10 +440,12 @@ class Flux2Pipeline(DiffusionPipeline):
                 packed_latents = packed_latents + (t_prev - t_curr) * pred
                 i += 1
                 progress_bar.update(1)
+        print(f"[pipeline] denoising loop ({i} steps) took {time.time()-_t_denoise:.1f}s")
 
         self._current_timestep = None
 
         # 7. Post-processing
+        _t_decode = time.time()
         latents = torch.cat(scatter_ids(packed_latents, img_ids)).squeeze(2)
 
         if output_type == "latent":
@@ -442,6 +455,7 @@ class Flux2Pipeline(DiffusionPipeline):
             image = self.vae.decode(latents).float()
 
             image = self.image_processor.postprocess(image, output_type=output_type)
+        print(f"[pipeline] VAE decode + postprocess took {time.time()-_t_decode:.1f}s")
 
         # Offload all models
         self.maybe_free_model_hooks()

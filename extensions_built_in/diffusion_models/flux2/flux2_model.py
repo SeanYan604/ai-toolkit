@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 import huggingface_hub
@@ -79,6 +80,7 @@ class Flux2Model(BaseModel):
         self.has_multiple_control_images = True
         # do not resize control images
         self.use_raw_control_images = True
+        self._cached_pipeline = None  # cache pipeline to avoid recreation
 
     # static method to get the noise scheduler
     @staticmethod
@@ -212,6 +214,13 @@ class Flux2Model(BaseModel):
 
         vae_state_dict = load_file(vae_path, device="cpu")
 
+        # 检测并转换 diffusers 格式的 state_dict
+        # diffusers 使用 "mid_block", "up_blocks", "down_blocks", "resnets" 等命名
+        # AutoEncoder 使用 "mid", "up", "down", "block" 等命名
+        if any(k.startswith("decoder.mid_block.") or k.startswith("encoder.down_blocks.") for k in vae_state_dict):
+            self.print_and_status_update("Converting diffusers VAE format to original format")
+            vae_state_dict = self._convert_diffusers_vae_state_dict(vae_state_dict)
+
         # cast to dtype
         for key in vae_state_dict:
             vae_state_dict[key] = vae_state_dict[key].to(dtype)
@@ -255,9 +264,100 @@ class Flux2Model(BaseModel):
         self.pipeline = pipe
         self.print_and_status_update("Model Loaded")
 
+    @staticmethod
+    def _convert_diffusers_vae_state_dict(sd: dict) -> dict:
+        """将 diffusers 格式的 VAE state_dict 转换为 AutoEncoder 原始格式"""
+        import re
+        new_sd = {}
+
+        for key, value in sd.items():
+            new_key = key
+
+            # ── 顶层 quant_conv → encoder.quant_conv ──
+            # ── 顶层 post_quant_conv → decoder.post_quant_conv ──
+            if key.startswith("quant_conv."):
+                new_key = "encoder." + key
+            elif key.startswith("post_quant_conv."):
+                new_key = "decoder." + key
+
+            # ── conv_norm_out → norm_out ──
+            elif ".conv_norm_out." in key:
+                new_key = key.replace(".conv_norm_out.", ".norm_out.")
+
+            # ── mid_block.attentions.0 → mid.attn_1 ──
+            elif ".mid_block.attentions.0." in key:
+                new_key = key.replace(".mid_block.attentions.0.", ".mid.attn_1.")
+                new_key = new_key.replace(".group_norm.", ".norm.")
+                new_key = new_key.replace(".to_k.", ".k.")
+                new_key = new_key.replace(".to_q.", ".q.")
+                new_key = new_key.replace(".to_v.", ".v.")
+                new_key = new_key.replace(".to_out.0.", ".proj_out.")
+
+            # ── mid_block.resnets.N → mid.block_{N+1} ──
+            elif ".mid_block.resnets." in key:
+                m = re.search(r'\.mid_block\.resnets\.(\d+)\.', key)
+                if m:
+                    idx = int(m.group(1)) + 1
+                    new_key = key.replace(f".mid_block.resnets.{m.group(1)}.", f".mid.block_{idx}.")
+
+            # ── encoder: down_blocks.N.resnets.M → down.N.block.M ──
+            elif "encoder.down_blocks." in key:
+                m = re.search(r'encoder\.down_blocks\.(\d+)\.resnets\.(\d+)\.', key)
+                if m:
+                    new_key = key.replace(
+                        f"encoder.down_blocks.{m.group(1)}.resnets.{m.group(2)}.",
+                        f"encoder.down.{m.group(1)}.block.{m.group(2)}."
+                    )
+                m2 = re.search(r'encoder\.down_blocks\.(\d+)\.downsamplers\.0\.', key)
+                if m2:
+                    new_key = key.replace(
+                        f"encoder.down_blocks.{m2.group(1)}.downsamplers.0.",
+                        f"encoder.down.{m2.group(1)}.downsample."
+                    )
+                # nin_shortcut (conv_shortcut in diffusers)
+                new_key = new_key.replace(".conv_shortcut.", ".nin_shortcut.")
+
+            # ── decoder: up_blocks.N.resnets.M → up.{3-N}.block.M ──
+            elif "decoder.up_blocks." in key:
+                m = re.search(r'decoder\.up_blocks\.(\d+)\.resnets\.(\d+)\.', key)
+                if m:
+                    # diffusers up_blocks 顺序与原始格式相反
+                    orig_idx = 3 - int(m.group(1))
+                    new_key = key.replace(
+                        f"decoder.up_blocks.{m.group(1)}.resnets.{m.group(2)}.",
+                        f"decoder.up.{orig_idx}.block.{m.group(2)}."
+                    )
+                m2 = re.search(r'decoder\.up_blocks\.(\d+)\.upsamplers\.0\.', key)
+                if m2:
+                    orig_idx = 3 - int(m2.group(1))
+                    new_key = key.replace(
+                        f"decoder.up_blocks.{m2.group(1)}.upsamplers.0.",
+                        f"decoder.up.{orig_idx}.upsample."
+                    )
+                # nin_shortcut
+                new_key = new_key.replace(".conv_shortcut.", ".nin_shortcut.")
+
+            # attention 权重: diffusers 存储为 (C, C), AutoEncoder 期望 (C, C, 1, 1)
+            if ".attn_1." in new_key and new_key.endswith(".weight") and value.dim() == 2:
+                value = value.unsqueeze(-1).unsqueeze(-1)
+
+            new_sd[new_key] = value
+
+        return new_sd
+
     def get_generation_pipeline(self):
+        if self._cached_pipeline is not None:
+            print("[generate] reusing cached Flux2Pipeline")
+            # update references in case model weights changed (LoRA merge etc.)
+            self._cached_pipeline.transformer = unwrap_model(self.transformer)
+            self._cached_pipeline.text_encoder = unwrap_model(self.text_encoder[0])
+            self._cached_pipeline.tokenizer = self.tokenizer[0]
+            self._cached_pipeline.vae = unwrap_model(self.vae)
+            return self._cached_pipeline
+
         scheduler = Flux2Model.get_train_scheduler()
 
+        _t0 = time.time()
         pipeline: Flux2Pipeline = Flux2Pipeline(
             scheduler=scheduler,
             text_encoder=unwrap_model(self.text_encoder[0]),
@@ -267,9 +367,14 @@ class Flux2Model(BaseModel):
             text_encoder_type=self.flux2_te_type,
             is_guidance_distilled=self.flux2_is_guidance_distilled,
         )
+        print(f"[generate] Flux2Pipeline created in {time.time()-_t0:.1f}s")
 
+        _t0 = time.time()
         pipeline = pipeline.to(self.device_torch)
+        _gpu_mem = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
+        print(f"[generate] pipeline.to(device) took {time.time()-_t0:.1f}s, GPU mem: {_gpu_mem:.1f}GB")
 
+        self._cached_pipeline = pipeline
         return pipeline
 
     def generate_single_image(
@@ -288,6 +393,7 @@ class Flux2Model(BaseModel):
             gen_config.height // self.get_bucket_divisibility()
         ) * self.get_bucket_divisibility()
 
+        _t0 = time.time()
         control_img_list = []
         if gen_config.ctrl_img is not None:
             control_img = Image.open(gen_config.ctrl_img)
@@ -305,10 +411,14 @@ class Flux2Model(BaseModel):
             control_img = Image.open(gen_config.ctrl_img_3)
             control_img = control_img.convert("RGB")
             control_img_list.append(control_img)
+        if control_img_list:
+            print(f"[generate] loaded {len(control_img_list)} control image(s) in {time.time()-_t0:.1f}s")
 
         if not self.flux2_is_guidance_distilled:
             extra["negative_prompt_embeds"] = unconditional_embeds.text_embeds
 
+        _t0 = time.time()
+        print(f"[generate] calling pipeline ({gen_config.width}x{gen_config.height}, {gen_config.num_inference_steps} steps)...")
         img = pipeline(
             prompt_embeds=conditional_embeds.text_embeds,
             height=gen_config.height,
@@ -320,6 +430,7 @@ class Flux2Model(BaseModel):
             control_img_list=control_img_list,
             **extra,
         ).images[0]
+        print(f"[generate] pipeline call took {time.time()-_t0:.1f}s")
         return img
 
     def get_noise_prediction(

@@ -5,6 +5,15 @@ import torch.utils.checkpoint as ckpt
 import math
 from dataclasses import dataclass, field
 
+# Flash Attention auto-detection (priority: FA2 > torch SDPA)
+_ATTN_BACKEND = "sdpa"  # default fallback
+try:
+    from flash_attn import flash_attn_func
+    _ATTN_BACKEND = "flash_attn"
+    print("[model] Using Flash Attention 2")
+except ImportError:
+    print("[model] Flash Attention not available, using torch SDPA")
+
 
 @dataclass
 class Flux2Params:
@@ -526,8 +535,16 @@ class QKNorm(torch.nn.Module):
 def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
     q, k = apply_rope(q, k, pe)
 
-    x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
-    x = rearrange(x, "B H L D -> B L (H D)")
+    if _ATTN_BACKEND == "flash_attn":
+        # flash_attn expects (B, L, H, D), not (B, H, L, D)
+        q = rearrange(q, "B H L D -> B L H D")
+        k = rearrange(k, "B H L D -> B L H D")
+        v = rearrange(v, "B H L D -> B L H D")
+        x = flash_attn_func(q, k, v)
+        x = rearrange(x, "B L H D -> B L (H D)")
+    else:
+        x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+        x = rearrange(x, "B H L D -> B L (H D)")
 
     return x
 
@@ -545,8 +562,11 @@ def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+    # Use the same dtype as freqs_cis (float32) for precision, but avoid
+    # unnecessary cast if already float32
+    dtype = freqs_cis.dtype
+    xq_ = xq.to(dtype).reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.to(dtype).reshape(*xk.shape[:-1], -1, 1, 2)
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
     return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
