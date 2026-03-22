@@ -292,7 +292,7 @@ class ToolkitModuleMixin:
         # always cast to float32
         lora_input = x.to(self.lora_down.weight.dtype)
         lora_output = self._call_forward(lora_input)
-        multiplier = self.network_ref().torch_multiplier
+        multiplier = self.network_ref().torch_multiplier.clone()
 
         lora_output_batch_size = lora_output.size(0)
         multiplier_batch_size = multiplier.size(0)

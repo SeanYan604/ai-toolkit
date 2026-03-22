@@ -317,7 +317,7 @@ class LokrModule(ToolkitModuleMixin, nn.Module):
 
         orig_weight = self.get_orig_weight(x.device)
         lokr_weight = self.get_weight(orig_weight).to(dtype=orig_weight.dtype)
-        multiplier = self.network_ref().torch_multiplier
+        multiplier = self.network_ref().torch_multiplier.clone()
 
         if x.dtype != orig_weight.dtype:
             x = x.to(dtype=orig_weight.dtype)
