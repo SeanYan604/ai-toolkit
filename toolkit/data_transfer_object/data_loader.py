@@ -170,6 +170,7 @@ class DataLoaderBatchDTO:
             self.latents: Union[torch.Tensor, None] = None
             self.control_tensor: Union[torch.Tensor, None] = None
             self.control_tensor_list: Union[List[List[torch.Tensor]], None] = None
+            self.cached_control_latents_list: Union[List[List[torch.Tensor]], None] = None
             self.clip_image_tensor: Union[torch.Tensor, None] = None
             self.mask_tensor: Union[torch.Tensor, None] = None
             self.unaugmented_tensor: Union[torch.Tensor, None] = None
@@ -265,6 +266,12 @@ class DataLoaderBatchDTO:
                         raise Exception(
                             f"Could not find control tensors for all file items, missing for {x.path}"
                         )
+
+            # handle cached control latents (Flux2-style pre-encoded)
+            if any([hasattr(x, 'has_cached_control_latents') and x.has_cached_control_latents for x in self.file_items]):
+                self.cached_control_latents_list = [
+                    x.get_control_latents() for x in self.file_items
+                ]
 
             self.inpaint_tensor: Union[torch.Tensor, None] = None
             if any([x.inpaint_tensor is not None for x in self.file_items]):

@@ -3,6 +3,10 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
 os.environ["HF_HOME"] = "/root/autodl-tmp/pretrained_models"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+
+if os.name == 'nt':
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync")
+
 import sys
 from typing import Union, OrderedDict
 from dotenv import load_dotenv
@@ -27,6 +31,58 @@ from toolkit.accelerator import get_accelerator
 from toolkit.print import print_acc, setup_log_to_file
 
 accelerator = get_accelerator()
+
+import torch
+if torch.cuda.is_available():
+    def _select_best_sdp_backend():
+        """Auto-select the fastest SDPA backend for this GPU."""
+        try:
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            q = torch.randn(1, 8, 256, 64, dtype=torch.bfloat16, device='cuda')
+            k = torch.randn(1, 8, 256, 64, dtype=torch.bfloat16, device='cuda')
+            v = torch.randn(1, 8, 256, 64, dtype=torch.bfloat16, device='cuda')
+            candidates = [
+                ("cudnn", SDPBackend.CUDNN_ATTENTION),
+                ("flash", SDPBackend.FLASH_ATTENTION),
+            ]
+            best_name, best_ms = None, float('inf')
+            import time
+            for name, backend in candidates:
+                try:
+                    with sdpa_kernel(backend):
+                        for _ in range(3):
+                            torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                        torch.cuda.synchronize()
+                        t0 = time.perf_counter()
+                        for _ in range(10):
+                            torch.nn.functional.scaled_dot_product_attention(q, k, v)
+                        torch.cuda.synchronize()
+                        ms = (time.perf_counter() - t0) / 10 * 1000
+                        if ms < best_ms:
+                            best_name, best_ms = name, ms
+                except Exception:
+                    pass
+            del q, k, v
+            torch.cuda.empty_cache()
+            # Always keep math enabled as universal fallback (VAE, etc.)
+            torch.backends.cuda.enable_math_sdp(True)
+            if best_name == "cudnn":
+                torch.backends.cuda.enable_cudnn_sdp(True)
+                torch.backends.cuda.enable_flash_sdp(False)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+                print_acc(f"[perf] Preferred SDPA backend: cuDNN ({best_ms:.2f}ms)")
+            elif best_name == "flash":
+                torch.backends.cuda.enable_cudnn_sdp(False)
+                torch.backends.cuda.enable_flash_sdp(True)
+                torch.backends.cuda.enable_mem_efficient_sdp(False)
+                print_acc(f"[perf] Preferred SDPA backend: Flash ({best_ms:.2f}ms)")
+            else:
+                print_acc("[perf] Keeping default SDPA backend selection")
+        except Exception as e:
+            print_acc(f"[perf] SDPA auto-select skipped: {e}")
+
+    _select_best_sdp_backend()
+    del _select_best_sdp_backend
 
 
 def print_end_message(jobs_completed, jobs_failed):

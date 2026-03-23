@@ -362,7 +362,7 @@ class BaseModel:
     def add_status_update_hook(self, func):
         self._status_update_hooks.append(func)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def generate_images(
             self,
             image_configs: List[GenerateImageConfig],
@@ -699,7 +699,7 @@ class BaseModel:
             try:
                 self.unet.to(self.device_torch)
             except Exception as e:
-                pass
+                print_acc(f"[generate] WARNING: unet.to({self.device_torch}) failed: {e}")
         if self.unet.dtype != self.torch_dtype:
             self.unet = self.unet.to(dtype=self.torch_dtype)
         if network.is_merged_in:
@@ -931,9 +931,7 @@ class BaseModel:
                 pass
         if self.unet.dtype != self.torch_dtype:
             self.unet = self.unet.to(dtype=self.torch_dtype)
-            
-        # check if get_noise prediction has guidance_embedding_scale
-        # if it does not, we dont pass it
+
         # cache the signature inspection to avoid repeated introspection overhead
         if not hasattr(self, '_noise_pred_signatures'):
             self._noise_pred_signatures = inspect.signature(self.get_noise_prediction).parameters
@@ -1493,8 +1491,8 @@ class BaseModel:
         if self.unet.device != state['unet']['device']:
             try:
                 self.unet.to(state['unet']['device'])
-            except Exception:
-                pass
+            except Exception as e:
+                print_acc(f"[set_device_state] WARNING: unet.to({state['unet']['device']}) failed: {e}")
         self._safe_requires_grad(self.unet, state['unet']['requires_grad'])
         if isinstance(self.text_encoder, list):
             for i, encoder in enumerate(self.text_encoder):

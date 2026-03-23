@@ -50,6 +50,24 @@ def scatter_ids(x: Tensor, x_ids: Tensor) -> list[Tensor]:
     return x_list
 
 
+def pack_encoded_refs(encoded_refs: list[Tensor], scale=10):
+    """Pack pre-encoded VAE latents (C, H, W) into token sequence with position IDs.
+
+    Returns (ref_tokens, ref_ids) with batch dimension added:
+      ref_tokens: (1, total_tokens, C) in bfloat16
+      ref_ids:    (1, total_tokens, 4)
+    """
+    t_off = [scale + scale * t for t in torch.arange(0, len(encoded_refs))]
+    t_off = [t.view(-1) for t in t_off]
+
+    ref_tokens, ref_ids = listed_prc_img(encoded_refs, t_coord=t_off)
+
+    ref_tokens = torch.cat(ref_tokens, dim=0).unsqueeze(0)
+    ref_ids = torch.cat(ref_ids, dim=0).unsqueeze(0)
+
+    return ref_tokens.to(torch.bfloat16), ref_ids
+
+
 def encode_image_refs(
     ae,
     img_ctx: Union[list[Image.Image], list[torch.Tensor]],
@@ -63,7 +81,6 @@ def encode_image_refs(
     if not isinstance(img_ctx_prep, list):
         img_ctx_prep = [img_ctx_prep]
 
-    # Encode each reference image
     encoded_refs = []
     for img in img_ctx_prep:
         if img.ndim == 3:
@@ -71,22 +88,7 @@ def encode_image_refs(
         encoded = ae.encode(img.to(ae.device, ae.dtype))[0]
         encoded_refs.append(encoded)
 
-    # Create time offsets for each reference
-    t_off = [scale + scale * t for t in torch.arange(0, len(encoded_refs))]
-    t_off = [t.view(-1) for t in t_off]
-
-    # Process with position IDs
-    ref_tokens, ref_ids = listed_prc_img(encoded_refs, t_coord=t_off)
-
-    # Concatenate all references along sequence dimension
-    ref_tokens = torch.cat(ref_tokens, dim=0)  # (total_ref_tokens, C)
-    ref_ids = torch.cat(ref_ids, dim=0)  # (total_ref_tokens, 4)
-
-    # Add batch dimension
-    ref_tokens = ref_tokens.unsqueeze(0)  # (1, total_ref_tokens, C)
-    ref_ids = ref_ids.unsqueeze(0)  # (1, total_ref_tokens, 4)
-
-    return ref_tokens.to(torch.bfloat16), ref_ids
+    return pack_encoded_refs(encoded_refs, scale=scale)
 
 
 def prc_txt(

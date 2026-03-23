@@ -8,15 +8,27 @@ def print_acc(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def _safe_write(target, message):
+    try:
+        target.write(message)
+    except UnicodeEncodeError:
+        encoding = getattr(target, 'encoding', None) or 'utf-8'
+        safe = message.encode(encoding, errors='replace').decode(encoding, errors='replace')
+        try:
+            target.write(safe)
+        except UnicodeEncodeError:
+            target.write(message.encode('ascii', errors='replace').decode('ascii'))
+
+
 class Logger:
     def __init__(self, filename):
         self.terminal = sys.stdout
-        self.log = open(filename, 'a')
+        self.log = open(filename, 'a', encoding='utf-8')
 
     def write(self, message):
-        self.terminal.write(message)
+        _safe_write(self.terminal, message)
         self.log.write(message)
-        self.log.flush()  # Make sure it's written immediately
+        self.log.flush()
 
     def flush(self):
         self.terminal.flush()

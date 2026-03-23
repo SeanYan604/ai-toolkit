@@ -279,7 +279,7 @@ class Flux2Pipeline(DiffusionPipeline):
     def interrupt(self):
         return self._interrupt
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def __call__(
         self,
         prompt: Union[str, List[str]] = None,

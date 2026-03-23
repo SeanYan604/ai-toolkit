@@ -2040,7 +2040,6 @@ class SDTrainer(BaseSDTrainProcess):
                     # loss.backward()
                     # else:
                     self.accelerator.backward(loss)
-
         return loss.detach()
         # flush()
 

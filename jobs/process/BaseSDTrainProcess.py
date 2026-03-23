@@ -728,7 +728,32 @@ class BaseSDTrainProcess(BaseTrainProcess):
         if self.accelerator.is_main_process:
             self.logger.start()
         self.prepare_accelerator()
-        
+        if self.train_config.torch_compile:
+            self._apply_torch_compile()
+
+    def _apply_torch_compile(self):
+        unet = self.sd.unet if self.sd.unet is not None else self.sd.model
+        if unet is None:
+            return
+        compiled_count = 0
+        for attr_name in ("double_blocks", "single_blocks",
+                          "transformer_blocks", "single_transformer_blocks"):
+            blocks = getattr(unet, attr_name, None)
+            if blocks is None:
+                continue
+            for block in blocks:
+                block.forward = torch.compile(
+                    block.forward, mode="reduce-overhead"
+                )
+                compiled_count += 1
+        if compiled_count > 0:
+            print_acc(
+                f"torch.compile applied to {compiled_count} transformer blocks "
+                f"(mode=reduce-overhead)"
+            )
+        else:
+            print_acc("torch.compile: no compilable blocks found on model")
+
     def sample_step_hook(self, img_num, total_imgs):
         pass
     
@@ -2097,7 +2122,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         self.phase_timer.stop('first_sample')
         print_acc(f"[phase] first_sample took {self.phase_timer.phases['first_sample']['duration']:.1f}s")
         
-        print_acc("[train] setting up progress bar and dataloaders...")
         if self.accelerator.is_local_main_process:
             self.progress_bar = ToolkitProgressBar(
                 total=self.train_config.steps,
@@ -2127,24 +2151,17 @@ class BaseSDTrainProcess(BaseTrainProcess):
         # zero any gradients
         optimizer.zero_grad()
 
-        print_acc("[train] setting train device state...")
-        _t0 = time.time()
         self.lr_scheduler.step(self.step_num)
 
         self.sd.set_device_state(self.train_device_state_preset)
         flush()
-        print_acc(f"[train] train device state set in {time.time()-_t0:.1f}s")
         # self.step_num = 0
 
         # print_acc(f"Compiling Model")
         # torch.compile(self.sd.unet, dynamic=True)
 
         # make sure all params require grad
-        print_acc("[train] ensuring params requires grad...")
-        sys.stdout.flush()
         self.ensure_params_requires_grad(force=True)
-        print_acc("[train] params requires grad set")
-        sys.stdout.flush()
 
 
         ###################################################################
@@ -2156,8 +2173,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
         start_step_num = self.step_num
         did_first_flush = False
         flush_next = False
-        print_acc(f"[train] entering training loop, start_step={start_step_num}, total_steps={self.train_config.steps}")
-        sys.stdout.flush()
         for step in range(start_step_num, self.train_config.steps):
             if self.train_config.do_paramiter_swapping:
                 self.optimizer.optimizer.swap_paramiters()
@@ -2209,14 +2224,8 @@ class BaseSDTrainProcess(BaseTrainProcess):
                         is_reg_step = True
                     elif dataloader is not None:
                         try:
-                            if step == start_step_num and b == 0:
-                                print_acc("[train] fetching first batch...")
-                                sys.stdout.flush()
                             with self.timer('get_batch'):
                                 batch = next(dataloader_iterator)
-                            if step == start_step_num and b == 0:
-                                print_acc("[train] first batch fetched")
-                                sys.stdout.flush()
                         except StopIteration:
                             with self.timer('reset_batch'):
                                 # hit the end of an epoch, reset
@@ -2258,9 +2267,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                 self.torch_profiler.start()
             did_oom = False
             loss_dict = None
-            if step == start_step_num:
-                print_acc(f"[train] starting first training step (step={step})...")
-                sys.stdout.flush()
             try:
                 with self.accelerator.accumulate(self.modules_being_trained):
                     if enable_perf_logging:
@@ -2268,9 +2274,6 @@ class BaseSDTrainProcess(BaseTrainProcess):
                     loss_dict = self.hook_train_loop(batch_list)
                     if enable_perf_logging:
                         self.timer.stop('train_step')
-                if step == start_step_num:
-                    print_acc(f"[train] first training step completed")
-                    sys.stdout.flush()
             except torch.cuda.OutOfMemoryError:
                 did_oom = True
             except RuntimeError as e:

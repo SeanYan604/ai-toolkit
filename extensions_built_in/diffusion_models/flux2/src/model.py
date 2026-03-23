@@ -177,7 +177,7 @@ class Flux2(nn.Module):
         pe_x = self.pe_embedder(x_ids)
         pe_ctx = self.pe_embedder(ctx_ids)
 
-        for block in self.double_blocks:
+        for bi, block in enumerate(self.double_blocks):
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 img, txt = ckpt.checkpoint(
                     block,
@@ -221,6 +221,7 @@ class Flux2(nn.Module):
         img = img[:, num_txt_tokens:, ...]
 
         img = self.final_layer(img, vec)
+
         return img
 
 
@@ -469,8 +470,19 @@ class EmbedND(nn.Module):
         self.dim = dim
         self.theta = theta
         self.axes_dim = axes_dim
+        self._cache_key: tuple | None = None
+        self._cache_val: Tensor | None = None
 
     def forward(self, ids: Tensor) -> Tensor:
+        cache_key = (ids.shape, ids.device, ids.dtype)
+        if (
+            self._cache_key == cache_key
+            and self._cache_val is not None
+            and self._cache_val.device == ids.device
+            and torch.equal(self._cache_val_ids, ids)
+        ):
+            return self._cache_val
+
         emb = torch.cat(
             [
                 rope(ids[..., i], self.axes_dim[i], self.theta)
@@ -479,7 +491,11 @@ class EmbedND(nn.Module):
             dim=-3,
         )
 
-        return emb.unsqueeze(1)
+        result = emb.unsqueeze(1)
+        self._cache_key = cache_key
+        self._cache_val = result
+        self._cache_val_ids = ids.detach().clone()
+        return result
 
 
 def timestep_embedding(t: Tensor, dim, max_period=10000, time_factor: float = 1000.0):
@@ -551,22 +567,22 @@ def attention(q: Tensor, k: Tensor, v: Tensor, pe: Tensor) -> Tensor:
 
 def rope(pos: Tensor, dim: int, theta: int) -> Tensor:
     assert dim % 2 == 0
-    scale = torch.arange(0, dim, 2, dtype=pos.dtype, device=pos.device) / dim
+    scale = torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
-    out = torch.einsum("...n,d->...nd", pos, omega)
+    out = torch.einsum("...n,d->...nd", pos.float(), omega)
     out = torch.stack(
         [torch.cos(out), -torch.sin(out), torch.sin(out), torch.cos(out)], dim=-1
     )
     out = rearrange(out, "b n d (i j) -> b n d i j", i=2, j=2)
-    return out.float()
+    return out
 
 
 def apply_rope(xq: Tensor, xk: Tensor, freqs_cis: Tensor) -> tuple[Tensor, Tensor]:
-    # Use the same dtype as freqs_cis (float32) for precision, but avoid
-    # unnecessary cast if already float32
-    dtype = freqs_cis.dtype
-    xq_ = xq.to(dtype).reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.to(dtype).reshape(*xk.shape[:-1], -1, 1, 2)
+    target_dtype = xq.dtype
+    if freqs_cis.dtype != target_dtype:
+        freqs_cis = freqs_cis.to(target_dtype)
+    xq_ = xq.reshape(*xq.shape[:-1], -1, 1, 2)
+    xk_ = xk.reshape(*xk.shape[:-1], -1, 1, 2)
     xq_out = freqs_cis[..., 0] * xq_[..., 0] + freqs_cis[..., 1] * xq_[..., 1]
     xk_out = freqs_cis[..., 0] * xk_[..., 0] + freqs_cis[..., 1] * xk_[..., 1]
-    return xq_out.reshape(*xq.shape).type_as(xq), xk_out.reshape(*xk.shape).type_as(xk)
+    return xq_out.reshape(*xq.shape), xk_out.reshape(*xk.shape)

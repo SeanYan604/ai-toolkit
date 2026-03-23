@@ -731,7 +731,7 @@ class ImageProcessingDTOMixin:
         # if we are caching latents, just do that
         if self.is_latent_cached:
             self.get_latent()
-            if self.has_control_image:
+            if self.has_control_image and not self.has_cached_control_latents:
                 self.load_control_image()
             if self.has_inpaint_image:
                 self.load_inpaint_image()
@@ -1747,6 +1747,7 @@ class LatentCachingFileItemDTOMixin:
         self._encoded_latent: Union[torch.Tensor, None] = None
         self._cached_first_frame_latent: Union[torch.Tensor, None] = None
         self._cached_audio_latent: Union[torch.Tensor, None] = None
+        self._cached_control_latents: Union[List[torch.Tensor], None] = None
         self._latent_path: Union[str, None] = None
         self.is_latent_cached = False
         self.is_caching_to_disk = False
@@ -1782,6 +1783,9 @@ class LatentCachingFileItemDTOMixin:
                 item["audio_normalize"] = True
             if self.dataset_config.audio_preserve_pitch:
                 item["audio_preserve_pitch"] = True
+        if hasattr(self, 'control_path') and self.control_path:
+            ctrl_paths = self.control_path if isinstance(self.control_path, list) else [self.control_path]
+            item["control_paths"] = [os.path.basename(p) for p in ctrl_paths]
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1804,17 +1808,18 @@ class LatentCachingFileItemDTOMixin:
     def cleanup_latent(self):
         if self._encoded_latent is not None:
             if not self.is_caching_to_memory:
-                # we are caching on disk, don't save in memory
                 self._encoded_latent = None
                 self._cached_first_frame_latent = None
                 self._cached_audio_latent = None
+                self._cached_control_latents = None
             else:
-                # move it back to cpu
                 self._encoded_latent = self._encoded_latent.to('cpu')
                 if self._cached_first_frame_latent is not None:
                     self._cached_first_frame_latent = self._cached_first_frame_latent.to('cpu')
                 if self._cached_audio_latent is not None:
                     self._cached_audio_latent = self._cached_audio_latent.to('cpu')
+                if self._cached_control_latents is not None:
+                    self._cached_control_latents = [t.to('cpu') for t in self._cached_control_latents]
 
     def get_latent(self, device=None):
         if not self.is_latent_cached:
@@ -1831,7 +1836,34 @@ class LatentCachingFileItemDTOMixin:
                 self._cached_first_frame_latent = state_dict['first_frame_latent']
             if 'audio_latent' in state_dict:
                 self._cached_audio_latent = state_dict['audio_latent']
+            ctrl_latents = []
+            idx = 0
+            while f'control_latent_{idx}' in state_dict:
+                ctrl_latents.append(state_dict[f'control_latent_{idx}'])
+                idx += 1
+            if ctrl_latents:
+                self._cached_control_latents = ctrl_latents
+            else:
+                self._cached_control_latents = []
         return self._encoded_latent
+
+    def get_control_latents(self: 'FileItemDTO') -> List[torch.Tensor]:
+        if not self.is_latent_cached:
+            return []
+        if self._cached_control_latents is None:
+            self.get_latent()
+        if self._cached_control_latents is None:
+            return []
+        return self._cached_control_latents
+
+    @property
+    def has_cached_control_latents(self) -> bool:
+        if self._cached_control_latents is not None:
+            return len(self._cached_control_latents) > 0
+        if not self.is_latent_cached or not self.is_caching_to_disk:
+            return False
+        self.get_latent()
+        return self._cached_control_latents is not None and len(self._cached_control_latents) > 0
 
 
 class LatentCachingMixin:
@@ -1852,7 +1884,12 @@ class LatentCachingMixin:
                 print_acc(" - Saving latents to disk")
             if to_memory:
                 print_acc(" - Keeping latents in memory")
-            # move sd items to cpu except for vae
+            has_control_caching = (
+                hasattr(self.sd, 'encode_control_for_cache')
+                and any(getattr(f, 'has_control_image', False) for f in self.file_list)
+            )
+            if has_control_caching:
+                print_acc(" - Caching control image latents alongside target latents")
             self.sd.set_device_state_preset('cache_latents')
 
             # use tqdm to show progress
@@ -1866,13 +1903,19 @@ class LatentCachingMixin:
                 # check if it is saved to disk already
                 if os.path.exists(latent_path):
                     if to_memory:
-                        # load it into memory
                         state_dict = load_file(latent_path, device='cpu')
                         file_item._encoded_latent = state_dict['latent'].to('cpu', dtype=self.sd.torch_dtype)
                         if 'first_frame_latent' in state_dict:
                             file_item._cached_first_frame_latent = state_dict['first_frame_latent'].to('cpu', dtype=self.sd.torch_dtype)
                         if 'audio_latent' in state_dict:
                             file_item._cached_audio_latent = state_dict['audio_latent'].to('cpu', dtype=self.sd.torch_dtype)
+                        ctrl_latents = []
+                        idx = 0
+                        while f'control_latent_{idx}' in state_dict:
+                            ctrl_latents.append(state_dict[f'control_latent_{idx}'].to('cpu'))
+                            idx += 1
+                        if ctrl_latents:
+                            file_item._cached_control_latents = ctrl_latents
                 else:
                     # not saved to disk, calculate
                     # load the image first
@@ -1910,21 +1953,41 @@ class LatentCachingMixin:
                         audio_latent = self.sd.encode_audio([file_item.audio_data]).squeeze(0)
                         if to_disk:
                             state_dict['audio_latent'] = audio_latent.clone().detach().cpu()
-                    
+
+                    control_latents = []
+                    if hasattr(file_item, 'has_control_image') and file_item.has_control_image:
+                        if hasattr(self.sd, 'encode_control_for_cache'):
+                            file_item.load_control_image()
+                            ctrl_tensors = []
+                            if file_item.control_tensor_list is not None:
+                                ctrl_tensors = file_item.control_tensor_list
+                            elif file_item.control_tensor is not None:
+                                ct = file_item.control_tensor
+                                if ct.dim() == 4:
+                                    ctrl_tensors = [ct[ci] for ci in range(ct.shape[0])]
+                                else:
+                                    ctrl_tensors = [ct]
+                            for ci, ct in enumerate(ctrl_tensors):
+                                ctrl_lat = self.sd.encode_control_for_cache(ct)
+                                control_latents.append(ctrl_lat)
+                                if to_disk:
+                                    state_dict[f'control_latent_{ci}'] = ctrl_lat.clone().detach().cpu()
+                            file_item.cleanup_control()
+
                     # save_latent
                     if to_disk:
-                        # metadata
                         meta = get_meta_for_safetensors(file_item.get_latent_info_dict())
                         os.makedirs(os.path.dirname(latent_path), exist_ok=True)
                         save_file(state_dict, latent_path, metadata=meta)
 
                     if to_memory:
-                        # keep it in memory
                         file_item._encoded_latent = latent.to('cpu', dtype=self.sd.torch_dtype)
                         if first_frame_latent is not None:
                             file_item._cached_first_frame_latent = first_frame_latent.to('cpu', dtype=self.sd.torch_dtype)
                         if audio_latent is not None:
                             file_item._cached_audio_latent = audio_latent.to('cpu', dtype=self.sd.torch_dtype)
+                        if control_latents:
+                            file_item._cached_control_latents = [t.to('cpu') for t in control_latents]
 
                     del imgs
                     del latent
