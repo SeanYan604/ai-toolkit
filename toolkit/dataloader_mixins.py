@@ -1792,14 +1792,10 @@ class LatentCachingFileItemDTOMixin:
             ctrl_paths = self.control_path if isinstance(self.control_path, list) else [self.control_path]
             item["control_paths"] = [os.path.basename(p) for p in ctrl_paths]
             # cache must invalidate when match_target_res toggles, since control1
-            # encoding limit_pixels depends on it
-            sd = getattr(self, 'sd', None)
-            if sd is not None and hasattr(sd, 'model_config'):
-                mt_res = bool(
-                    getattr(sd.model_config, 'model_kwargs', {}).get('match_target_res', False)
-                )
-                if mt_res:
-                    item["control_match_target_res"] = True
+            # encoding limit_pixels depends on it. Snapshot is taken in
+            # FileItemDTO.__init__ so we do not have to keep an sd reference here.
+            if getattr(self, "_control_match_target_res", False):
+                item["control_match_target_res"] = True
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):

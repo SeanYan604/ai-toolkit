@@ -1,4 +1,3 @@
-import copy
 import os
 from typing import TYPE_CHECKING, List, Union
 import cv2
@@ -55,7 +54,19 @@ class FileItemDTO(
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get("path", "")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
-        self.sd = kwargs.get("sd", None)
+        # NOTE: do NOT store sd on the file item. It would carry CUDA tensors
+        # into DataLoader fork workers and crash both deepcopy and pickle
+        # (multiprocessing queue serialization triggers _share_cuda_).
+        # Snapshot the only flag latent cache key needs from sd at construction.
+        sd = kwargs.get("sd", None)
+        mt_res = False
+        if sd is not None and hasattr(sd, "model_config"):
+            mt_res = bool(
+                getattr(sd.model_config, "model_kwargs", {}).get(
+                    "match_target_res", False
+                )
+            )
+        self._control_match_target_res: bool = mt_res
         self.is_video = self.dataset_config.num_frames > 1
         size_database = kwargs.get("size_database", {})
         dataset_root = kwargs.get("dataset_root", None)
@@ -161,23 +172,6 @@ class FileItemDTO(
         self.cleanup_clip_image()
         self.cleanup_mask()
         self.cleanup_unconditional()
-
-    def __deepcopy__(self, memo):
-        # Avoid deep-copying self.sd (the StableDiffusion model with CUDA tensors).
-        # DataLoader workers (forked subprocesses) cannot re-initialize CUDA, so a
-        # deepcopy of any CUDA tensor inside sd would raise:
-        #   "Cannot re-initialize CUDA in forked subprocess".
-        # Workers never actually use sd during fetch (load_and_process_image only
-        # reads cached latents/text embeddings from disk), so a shallow ref is safe.
-        cls = self.__class__
-        new_obj = cls.__new__(cls)
-        memo[id(self)] = new_obj
-        for k, v in self.__dict__.items():
-            if k == "sd":
-                new_obj.sd = v
-                continue
-            new_obj.__dict__[k] = copy.deepcopy(v, memo)
-        return new_obj
 
 
 class DataLoaderBatchDTO:
