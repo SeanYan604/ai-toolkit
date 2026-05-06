@@ -885,6 +885,9 @@ class DatasetConfig:
         self.control_path: Union[str,List[str]] = kwargs.get('control_path', None)  # depth maps, etc
         if self.control_path == '':
             self.control_path = None
+        # If true, append control count to bucket key so each batch has a uniform
+        # number of controls (required for variable control2 dropout). Default True.
+        self.bucket_by_control_count: bool = kwargs.get('bucket_by_control_count', True)
         
         # handle multi control inputs from the ui. It is just easier to handle it here for a cleaner ui experience
         control_path_1 = kwargs.get('control_path_1', None)

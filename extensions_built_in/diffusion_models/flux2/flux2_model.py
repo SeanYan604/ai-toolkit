@@ -1,4 +1,3 @@
-import math
 import os
 import time
 from typing import TYPE_CHECKING, List, Optional
@@ -25,7 +24,6 @@ from .src.pipeline import Flux2Pipeline
 from .src.autoencoder import AutoEncoder, AutoEncoderParams
 from safetensors.torch import load_file, save_file
 from PIL import Image
-import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from toolkit.data_transfer_object.data_loader import DataLoaderBatchDTO
@@ -477,15 +475,15 @@ class Flux2Model(BaseModel):
                         latent_model_input.shape
                     )
 
-                    control_image_max_res = 1024 * 1024
-                    if self.model_config.model_kwargs.get("match_target_res", False):
-                        control_image_res = (
-                            height
-                            * self.pipeline.vae_scale_factor
-                            * width
-                            * self.pipeline.vae_scale_factor
-                        )
-                        control_image_max_res = control_image_res
+                    target_pixels = (
+                        height
+                        * self.pipeline.vae_scale_factor
+                        * width
+                        * self.pipeline.vae_scale_factor
+                    )
+                    match_target_res = self.model_config.model_kwargs.get(
+                        "match_target_res", False
+                    )
 
                     if len(batch_control_tensor_list) != batch_size:
                         raise ValueError(
@@ -499,23 +497,16 @@ class Flux2Model(BaseModel):
                             )
                             if len(control_img.shape) == 3:
                                 control_img = control_img.unsqueeze(0)
-
-                            if self.model_config.model_kwargs.get(
-                                "match_target_res", False
-                            ):
-                                ratio = control_img.shape[2] / control_img.shape[3]
-                                c_width = math.sqrt(control_image_res * ratio)
-                                c_height = c_width / ratio
-
-                                c_width = round(c_width / 32) * 32
-                                c_height = round(c_height / 32) * 32
-
-                                control_img = F.interpolate(
-                                    control_img, size=(c_height, c_width), mode="bilinear"
-                                )
-
                             control_img = control_img * 2 - 1
                             controls.append(control_img)
+
+                        # control1 (sub_idx==0) optionally aligns with target pixels
+                        # (dataloader already 16-aligned to target bucket); control2+
+                        # always cap to 1024**2 with 16 alignment by default_prep.
+                        limit_pixels_list = [
+                            (target_pixels if (sub_idx == 0 and match_target_res) else 1024 * 1024)
+                            for sub_idx in range(len(controls))
+                        ]
 
                         _vae_was_offloaded = False
                         if hasattr(self.vae, 'device') and self.vae.device != self.device_torch:
@@ -524,7 +515,7 @@ class Flux2Model(BaseModel):
                             self.vae.to(self.device_torch)
 
                         img_cond_seq_item, img_cond_seq_ids_item = encode_image_refs(
-                            self.vae, controls, limit_pixels=control_image_max_res
+                            self.vae, controls, limit_pixels=limit_pixels_list
                         )
 
                         if _vae_was_offloaded:
@@ -660,11 +651,17 @@ class Flux2Model(BaseModel):
 
         return latents
 
-    def encode_control_for_cache(self, control_tensor: torch.Tensor) -> torch.Tensor:
+    def encode_control_for_cache(
+        self,
+        control_tensor: torch.Tensor,
+        control_index: int = 0,
+        target_height: int | None = None,
+        target_width: int | None = None,
+    ) -> torch.Tensor:
         """Encode a single control image tensor [0,1] into a VAE latent for caching.
 
-        Applies the same preprocessing as get_noise_prediction + encode_image_refs:
-        scale to [-1,1], default_prep (cap_pixels, center_crop), then VAE encode.
+        Equivalent to forward path: control1 (control_index==0) optionally aligns
+        with target pixels when match_target_res=True; control2+ always cap 1024**2.
         """
         with torch.no_grad():
             if self.vae.device == torch.device("cpu"):
@@ -673,7 +670,20 @@ class Flux2Model(BaseModel):
             if img.dim() == 4:
                 img = img.squeeze(0)
             img = img * 2 - 1
-            limit_pixels = 1024 * 1024
+
+            match_target_res = self.model_config.model_kwargs.get(
+                "match_target_res", False
+            )
+            if (
+                control_index == 0
+                and match_target_res
+                and target_height is not None
+                and target_width is not None
+            ):
+                limit_pixels = int(target_height) * int(target_width)
+            else:
+                limit_pixels = 1024 * 1024
+
             img = default_prep(img, limit_pixels=limit_pixels)
             if img.dim() == 3:
                 img = img.unsqueeze(0)

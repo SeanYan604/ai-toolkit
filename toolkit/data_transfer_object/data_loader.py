@@ -54,6 +54,7 @@ class FileItemDTO(
     def __init__(self, *args, **kwargs):
         self.path = kwargs.get("path", "")
         self.dataset_config: "DatasetConfig" = kwargs.get("dataset_config", None)
+        self.sd = kwargs.get("sd", None)
         self.is_video = self.dataset_config.num_frames > 1
         size_database = kwargs.get("size_database", {})
         dataset_root = kwargs.get("dataset_root", None)
@@ -259,19 +260,37 @@ class DataLoaderBatchDTO:
             # handle control tensor list
             if any([x.control_tensor_list is not None for x in self.file_items]):
                 self.control_tensor_list = []
+                expected_ctrl_count = None
                 for x in self.file_items:
-                    if x.control_tensor_list is not None:
-                        self.control_tensor_list.append(x.control_tensor_list)
-                    else:
+                    if x.control_tensor_list is None:
                         raise Exception(
                             f"Could not find control tensors for all file items, missing for {x.path}"
                         )
+                    if expected_ctrl_count is None:
+                        expected_ctrl_count = len(x.control_tensor_list)
+                    elif len(x.control_tensor_list) != expected_ctrl_count:
+                        raise Exception(
+                            f"Inconsistent control count in batch (got {len(x.control_tensor_list)}, "
+                            f"expected {expected_ctrl_count}) for {x.path}; "
+                            f"enable bucket_by_control_count to fix"
+                        )
+                    self.control_tensor_list.append(x.control_tensor_list)
 
             # handle cached control latents (Flux2-style pre-encoded)
             if any([hasattr(x, 'has_cached_control_latents') and x.has_cached_control_latents for x in self.file_items]):
                 self.cached_control_latents_list = [
                     x.get_control_latents() for x in self.file_items
                 ]
+                expected_ctrl_count = None
+                for x, lats in zip(self.file_items, self.cached_control_latents_list):
+                    if expected_ctrl_count is None:
+                        expected_ctrl_count = len(lats)
+                    elif len(lats) != expected_ctrl_count:
+                        raise Exception(
+                            f"Inconsistent cached control latent count in batch "
+                            f"(got {len(lats)}, expected {expected_ctrl_count}) for {x.path}; "
+                            f"enable bucket_by_control_count to fix"
+                        )
 
             self.inpaint_tensor: Union[torch.Tensor, None] = None
             if any([x.inpaint_tensor is not None for x in self.file_items]):

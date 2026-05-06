@@ -72,20 +72,28 @@ def encode_image_refs(
     ae,
     img_ctx: Union[list[Image.Image], list[torch.Tensor]],
     scale=10,
-    limit_pixels=1024**2,
+    limit_pixels: Union[int, list[int]] = 1024**2,
 ):
     if not img_ctx:
         return None, None
 
-    img_ctx_prep = default_prep(img=img_ctx, limit_pixels=limit_pixels)
-    if not isinstance(img_ctx_prep, list):
-        img_ctx_prep = [img_ctx_prep]
+    if isinstance(limit_pixels, (list, tuple)):
+        assert len(limit_pixels) == len(img_ctx), (
+            f"limit_pixels list length {len(limit_pixels)} != img_ctx length {len(img_ctx)}"
+        )
+        limits = list(limit_pixels)
+    else:
+        limits = [limit_pixels] * len(img_ctx)
 
     encoded_refs = []
-    for img in img_ctx_prep:
-        if img.ndim == 3:
-            img = img.unsqueeze(0)
-        encoded = ae.encode(img.to(ae.device, ae.dtype))[0]
+    for img, lp in zip(img_ctx, limits):
+        prepped = default_prep(img=img, limit_pixels=lp)
+        if isinstance(prepped, list):
+            assert len(prepped) == 1
+            prepped = prepped[0]
+        if prepped.ndim == 3:
+            prepped = prepped.unsqueeze(0)
+        encoded = ae.encode(prepped.to(ae.device, ae.dtype))[0]
         encoded_refs.append(encoded)
 
     return pack_encoded_refs(encoded_refs, scale=scale)

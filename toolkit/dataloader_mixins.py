@@ -277,6 +277,11 @@ class BucketsMixin:
 
             # check if bucket exists, if not, create it
             bucket_key = f'{file_item.crop_width}x{file_item.crop_height}'
+            if getattr(config, 'bucket_by_control_count', False):
+                ctrl_paths = getattr(file_item, 'control_path', None)
+                if ctrl_paths:
+                    ctrl_count = len(ctrl_paths) if isinstance(ctrl_paths, list) else 1
+                    bucket_key = f'{bucket_key}_c{ctrl_count}'
             if bucket_key not in self.buckets:
                 self.buckets[bucket_key] = Bucket(file_item.crop_width, file_item.crop_height)
             self.buckets[bucket_key].file_list_idx.append(idx)
@@ -1786,6 +1791,15 @@ class LatentCachingFileItemDTOMixin:
         if hasattr(self, 'control_path') and self.control_path:
             ctrl_paths = self.control_path if isinstance(self.control_path, list) else [self.control_path]
             item["control_paths"] = [os.path.basename(p) for p in ctrl_paths]
+            # cache must invalidate when match_target_res toggles, since control1
+            # encoding limit_pixels depends on it
+            sd = getattr(self, 'sd', None)
+            if sd is not None and hasattr(sd, 'model_config'):
+                mt_res = bool(
+                    getattr(sd.model_config, 'model_kwargs', {}).get('match_target_res', False)
+                )
+                if mt_res:
+                    item["control_match_target_res"] = True
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
@@ -1968,7 +1982,12 @@ class LatentCachingMixin:
                                 else:
                                     ctrl_tensors = [ct]
                             for ci, ct in enumerate(ctrl_tensors):
-                                ctrl_lat = self.sd.encode_control_for_cache(ct)
+                                ctrl_lat = self.sd.encode_control_for_cache(
+                                    ct,
+                                    control_index=ci,
+                                    target_height=file_item.crop_height,
+                                    target_width=file_item.crop_width,
+                                )
                                 control_latents.append(ctrl_lat)
                                 if to_disk:
                                     state_dict[f'control_latent_{ci}'] = ctrl_lat.clone().detach().cpu()
