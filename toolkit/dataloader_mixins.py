@@ -69,6 +69,41 @@ transforms_dict = {
 img_ext_list = ['.jpg', '.jpeg', '.png', '.webp']
 
 
+def get_encoded_control_size(w: int, h: int, limit_pixels: int = 1024 * 1024, multiple: int = 16):
+    """Deterministically compute the spatial size a control image will have AFTER
+    the encode-time ``default_prep`` (cap_pixels(limit) -> center-crop to a multiple).
+
+    Mirrors ``flux2/src/sampling.py`` ``cap_pixels`` + ``center_crop_to_multiple_of_x``
+    exactly, using only the native (w, h). Used to bucket native (non-target-aligned)
+    control2/3 so that a single batch never mixes control token counts.
+    """
+    w = int(w)
+    h = int(h)
+    if w * h > limit_pixels:
+        scale = math.sqrt(limit_pixels / float(w * h))
+        w = int(w * scale)
+        h = int(h * scale)
+    w = (w // multiple) * multiple
+    h = (h // multiple) * multiple
+    return w, h
+
+
+def _read_image_size_with_exif(path: str):
+    """Return (w, h) as load_control_image would see it (after exif_transpose),
+    without decoding pixel data. Reads only header + EXIF orientation tag."""
+    with Image.open(path) as im:
+        w, h = im.size
+        try:
+            exif = im.getexif()
+            orientation = exif.get(0x0112, 1) if exif else 1
+        except Exception:
+            orientation = 1
+    # orientations 5/6/7/8 swap width/height after exif_transpose
+    if orientation in (5, 6, 7, 8):
+        w, h = h, w
+    return w, h
+
+
 def standardize_images(images):
     """
     Standardize the given batch of images using the specified mean and std.
@@ -282,6 +317,10 @@ class BucketsMixin:
                 if ctrl_paths:
                     ctrl_count = len(ctrl_paths) if isinstance(ctrl_paths, list) else 1
                     bucket_key = f'{bucket_key}_c{ctrl_count}'
+            # native control2/3 sizes must not be mixed within a batch
+            ctrl_size_suffix = getattr(file_item, 'control_bucket_key_suffix', '')
+            if ctrl_size_suffix:
+                bucket_key = f'{bucket_key}{ctrl_size_suffix}'
             if bucket_key not in self.buckets:
                 self.buckets[bucket_key] = Bucket(file_item.crop_width, file_item.crop_height)
             self.buckets[bucket_key].file_list_idx.append(idx)
@@ -939,6 +978,9 @@ class ControlFileItemDTOMixin:
         self.control_path: Union[str, List[str], None] = None
         self.control_tensor: Union[torch.Tensor, None] = None
         self.control_tensor_list: Union[List[torch.Tensor], None] = None
+        # suffix appended to the bucket key so native (non-target-aligned)
+        # control2/3 of different sizes never land in the same batch.
+        self.control_bucket_key_suffix: str = ''
         sd = kwargs.get('sd', None)
         self.use_raw_control_images = sd is not None and sd.use_raw_control_images
         dataset_config: 'DatasetConfig' = kwargs.get('dataset_config', None)
@@ -967,13 +1009,35 @@ class ControlFileItemDTOMixin:
                 # only do one
                 self.control_path = self.control_path[0]
 
+            # When control2/3 keep their native size (raw + full-size), their
+            # encoded token count varies per image, so it must be part of the
+            # bucket key. control1 (index 0) is always target-aligned and uniform
+            # within a target bucket, so it is excluded here.
+            if (
+                self.use_raw_control_images
+                and self.full_size_control_images
+                and isinstance(self.control_path, list)
+                and len(self.control_path) >= 2
+            ):
+                suffix_parts = []
+                for ci in range(1, len(self.control_path)):
+                    cpath = self.control_path[ci]
+                    try:
+                        cw, ch = _read_image_size_with_exif(cpath)
+                        ew, eh = get_encoded_control_size(cw, ch)
+                        suffix_parts.append(f'cs{ci}_{ew}x{eh}')
+                    except Exception as e:
+                        print_acc(f'Error reading control size for bucketing: {cpath}: {e}')
+                if suffix_parts:
+                    self.control_bucket_key_suffix = '_' + '_'.join(suffix_parts)
+
     def load_control_image(self: 'FileItemDTO'):
         control_tensors = []
         control_path_list = self.control_path
         if not isinstance(self.control_path, list):
             control_path_list = [self.control_path]
         
-        for control_path in control_path_list:
+        for ctrl_idx, control_path in enumerate(control_path_list):
             try:
                 img = Image.open(control_path)
                 img = exif_transpose(img)
@@ -1020,14 +1084,22 @@ class ControlFileItemDTOMixin:
                     ))
                 else:
                     raise Exception("Control images not supported for non-bucket datasets")
+            elif ctrl_idx >= 1:
+                # control2/3（副参考图）：保留原生尺寸，不对齐 target bucket。
+                # flip 与尺寸无关，仍随 target 一起做以保持增广一致性；
+                # 1024**2 cap 与 16 对齐由编码阶段 default_prep 负责。
+                if self.flip_x:
+                    img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                if self.flip_y:
+                    img = img.transpose(Image.FLIP_TOP_BOTTOM)
             else:
+                # control1（主参考图）：使用与 target 完全相同的 bucket 参数对齐
                 w, h = img.size
                 if self.flip_x:
                     img = img.transpose(Image.FLIP_LEFT_RIGHT)
                 if self.flip_y:
                     img = img.transpose(Image.FLIP_TOP_BOTTOM)
 
-                # 使用与 target 完全相同的 bucket 参数
                 img = img.resize((self.scale_to_width, self.scale_to_height), Image.BICUBIC)
                 img = img.crop((
                     self.crop_x,
@@ -1035,7 +1107,6 @@ class ControlFileItemDTOMixin:
                     self.crop_x + self.crop_width,
                     self.crop_y + self.crop_height
                 ))
-                # else: 保持原始尺寸（默认行为）
             transform = transforms.Compose([
                 transforms.ToTensor(),
             ])
@@ -1796,6 +1867,15 @@ class LatentCachingFileItemDTOMixin:
             # FileItemDTO.__init__ so we do not have to keep an sd reference here.
             if getattr(self, "_control_match_target_res", False):
                 item["control_match_target_res"] = True
+            # control2/3 now keep native size (no target-bucket resize) when using
+            # raw + full-size control images. Encode pixels differ from the old
+            # target-aligned behavior, so invalidate any pre-existing cache.
+            if (
+                len(ctrl_paths) >= 2
+                and getattr(self, "use_raw_control_images", False)
+                and getattr(self, "full_size_control_images", False)
+            ):
+                item["control_secondary_native"] = True
         return item
 
     def get_latent_path(self: 'FileItemDTO', recalculate=False):
