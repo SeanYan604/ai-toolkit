@@ -347,24 +347,43 @@ class QwenImage2Model(BaseModel):
         """Reference images -> `(B, N, C)` packed latents plus their latent grids.
 
         `control_images` is a per-sample list of `(1, C, H, W)` tensors in
-        [0, 1], already at their final size.
+        [0, 1], already at their final size. References that share a spatial
+        size go through one VAE forward; `latent_dist.sample()` still draws an
+        independent sample per image.
         """
         if not control_images or not any(len(sample) for sample in control_images):
             return None, []
 
-        sample_latents, shapes = [], []
-        for index, sample in enumerate(control_images):
-            packed = []
+        flat = []
+        for sample_index, sample in enumerate(control_images):
             for image in sample:
-                latent = self.encode_images(
-                    [image[0].to(self.device_torch) * 2 - 1],
-                    device=self.device_torch,
-                    dtype=self.torch_dtype,
-                )
-                if index == 0:
-                    shapes.append((latent.shape[2], latent.shape[3]))
-                packed.append(pack_latents(latent))
-            sample_latents.append(torch.cat(packed, dim=1))
+                flat.append((sample_index, image[0]))
+
+        groups = {}
+        for index, (_, image) in enumerate(flat):
+            groups.setdefault(tuple(image.shape), []).append(index)
+
+        encoded = [None] * len(flat)
+        for indices in groups.values():
+            batch = [
+                flat[index][1].to(self.device_torch) * 2 - 1 for index in indices
+            ]
+            latents = self.encode_images(
+                batch,
+                device=self.device_torch,
+                dtype=self.torch_dtype,
+            )
+            for row, index in enumerate(indices):
+                encoded[index] = latents[row : row + 1]
+
+        sample_latents = [[] for _ in control_images]
+        shapes = []
+        for index, (sample_index, _) in enumerate(flat):
+            latent = encoded[index]
+            if sample_index == 0:
+                shapes.append((latent.shape[2], latent.shape[3]))
+            sample_latents[sample_index].append(pack_latents(latent))
+        sample_latents = [torch.cat(packed, dim=1) for packed in sample_latents]
 
         lengths = {latents.shape[1] for latents in sample_latents}
         if len(lengths) > 1:

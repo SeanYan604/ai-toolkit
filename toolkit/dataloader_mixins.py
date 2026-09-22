@@ -2443,6 +2443,27 @@ class TextEmbeddingFileItemDTOMixin:
         # if we have a control image, cache the path
         if self.encode_control_in_text_embeddings and self.control_path is not None:
             item["control_path"] = self.control_path
+            # Bucket-aligned references (Qwen-Image 2.1 and the same class of
+            # edit models) are cropped and flipped before the text encoder sees
+            # them. The geometry has to be in the key or a raw-image cache, a
+            # different crop, or the flipped copy of this file is reused.
+            if (
+                not getattr(self, "use_raw_control_images", False)
+                and not getattr(self, "control_video_paths", None)
+            ):
+                item["control_crop_x"] = self.crop_x
+                item["control_crop_y"] = self.crop_y
+                item["control_crop_width"] = self.crop_width
+                item["control_crop_height"] = self.crop_height
+                if self.flip_x:
+                    item["flip_x"] = True
+                if self.flip_y:
+                    item["flip_y"] = True
+                if self.load_rgba:
+                    item["load_rgba"] = True
+                max_pixels = getattr(self, "_control_image_max_pixels", None)
+                if max_pixels is not None and int(max_pixels) != 1024 * 1024:
+                    item["control_image_max_pixels"] = int(max_pixels)
         if self.encode_control_in_text_embeddings and getattr(self, 'control_video_paths', None):
             item["control_videos"] = sorted(self.control_video_paths)
             # v2: reference-video vision blocks are no longer resampled by the
@@ -2611,6 +2632,30 @@ class TextEmbeddingFileItemDTOMixin:
                 dopsd_path = self.get_dopsd_text_embedding_path()
             self.dopsd_prompt_embeds = PromptEmbeds.load(dopsd_path)
 
+def _bucket_control_tensors_for_prompt(file_item, sd):
+    """Bucket-aligned control tensors as `(1, C, H, W)` in `[0, 1]`.
+
+    `load_control_image` stores one reference as `(C, H, W)` and several as
+    `(N, C, H, W)`. Prompt encoding wants one batched tensor per reference,
+    matching the live training path.
+    """
+    tensor = file_item.control_tensor
+    if tensor is None:
+        return []
+    if tensor.dim() == 3:
+        images = [tensor]
+    elif tensor.dim() == 4:
+        images = [tensor[i] for i in range(tensor.shape[0])]
+    else:
+        raise ValueError(
+            f"control tensor for {file_item.path} has shape {tuple(tensor.shape)}"
+        )
+    return [
+        image.unsqueeze(0).to(sd.device_torch, dtype=sd.torch_dtype)
+        for image in images
+    ]
+
+
 class TextEmbeddingCachingMixin:
     def __init__(self: 'AiToolkitDataset', **kwargs):
         # if we have super, call it
@@ -2664,53 +2709,71 @@ class TextEmbeddingCachingMixin:
                     if file_item.encode_control_in_text_embeddings and (
                         file_item.control_path is not None or len(control_video_paths) > 0
                     ):
-                        ctrl_img_list = []
-                        control_path_list = file_item.control_path
-                        if control_path_list is None:
-                            control_path_list = []
-                        elif not isinstance(control_path_list, list):
-                            control_path_list = [control_path_list]
-                        for i in range(len(control_path_list)):
-                            try:
-                                img = Image.open(control_path_list[i]).convert("RGB")
-                                img = exif_transpose(img)
-                                # convert to 0 to 1 tensor
-                                img = (
-                                    TF.to_tensor(img)
-                                    .unsqueeze(0)
-                                    .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                        # Images that the dataloader bucket-aligns must be cached
+                        # from those same pixels. A raw open here reserves a
+                        # different slot count than the training forward.
+                        use_bucket_controls = (
+                            file_item.control_path is not None
+                            and not getattr(file_item, "use_raw_control_images", False)
+                            and len(control_video_paths) == 0
+                        )
+                        try:
+                            if use_bucket_controls:
+                                file_item.load_control_image()
+                                ctrl_img_list = _bucket_control_tensors_for_prompt(
+                                    file_item, self.sd
                                 )
-                                ctrl_img_list.append(img)
-                            except Exception as e:
-                                print_acc(f"Error: {e}")
-                                print_acc(f"Error loading control image: {control_path_list[i]}")
-                        # control VIDEOS ride into the presentation by path (models
-                        # with supports_video_control_images turn them into
-                        # timestamped vision blocks); images first, then videos.
-                        # The model needs the dataset config to treat the clip
-                        # exactly like its latent rows (frame count / trim)
-                        ctrl_img_list.extend(control_video_paths)
-                        if len(control_video_paths) > 0:
-                            self.sd._ref_video_dataset_config = self.dataset_config
-                        
-                        if len(ctrl_img_list) == 0:
-                            ctrl_img = None
-                        elif not self.sd.has_multiple_control_images:
-                            ctrl_img = ctrl_img_list[0]
-                        else:
-                            ctrl_img = ctrl_img_list
-                        for path, caption in encode_targets:
-                            if path in dropout_target_paths:
-                                # dropout embeds are plain text. Only fall back to the
-                                # control images if the model cannot encode without them
-                                try:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
-                                except Exception:
-                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
                             else:
-                                prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
-                            prompt_embeds.save(path)
-                            del prompt_embeds
+                                ctrl_img_list = []
+                                control_path_list = file_item.control_path
+                                if control_path_list is None:
+                                    control_path_list = []
+                                elif not isinstance(control_path_list, list):
+                                    control_path_list = [control_path_list]
+                                for i in range(len(control_path_list)):
+                                    try:
+                                        img = Image.open(control_path_list[i]).convert("RGB")
+                                        img = exif_transpose(img)
+                                        # convert to 0 to 1 tensor
+                                        img = (
+                                            TF.to_tensor(img)
+                                            .unsqueeze(0)
+                                            .to(self.sd.device_torch, dtype=self.sd.torch_dtype)
+                                        )
+                                        ctrl_img_list.append(img)
+                                    except Exception as e:
+                                        print_acc(f"Error: {e}")
+                                        print_acc(f"Error loading control image: {control_path_list[i]}")
+                                # control VIDEOS ride into the presentation by path (models
+                                # with supports_video_control_images turn them into
+                                # timestamped vision blocks); images first, then videos.
+                                # The model needs the dataset config to treat the clip
+                                # exactly like its latent rows (frame count / trim)
+                                ctrl_img_list.extend(control_video_paths)
+                                if len(control_video_paths) > 0:
+                                    self.sd._ref_video_dataset_config = self.dataset_config
+
+                            if len(ctrl_img_list) == 0:
+                                ctrl_img = None
+                            elif not self.sd.has_multiple_control_images:
+                                ctrl_img = ctrl_img_list[0]
+                            else:
+                                ctrl_img = ctrl_img_list
+                            for path, caption in encode_targets:
+                                if path in dropout_target_paths:
+                                    # dropout embeds are plain text. Only fall back to the
+                                    # control images if the model cannot encode without them
+                                    try:
+                                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption)
+                                    except Exception:
+                                        prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                                else:
+                                    prompt_embeds: PromptEmbeds = self.sd.encode_prompt(caption, control_images=ctrl_img)
+                                prompt_embeds.save(path)
+                                del prompt_embeds
+                        finally:
+                            if use_bucket_controls:
+                                file_item.cleanup_control()
                     elif (
                         getattr(self.sd, 'encode_first_frame_in_text_embeddings', False)
                         and self.dataset_config.do_i2v

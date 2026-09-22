@@ -556,6 +556,9 @@ export const AI_TOOLKIT_UI_MODELS: ModelArch[] = [
       "config.process[0].model.qtype": ["convrot8", "qfloat8"],
       "config.process[0].model.qtype_te": ["convrot8", "qfloat8"],
       "config.process[0].sample.guidance_scale": [3.0, 4.0],
+      // reference slots must match the bucketed controls; caching encodes them
+      // once and then unloads the 8B vision-language encoder
+      "config.process[0].train.cache_text_embeddings": [true, false],
       // the VAE is RGBA: images load, encode and decode with their alpha
       "config.process[0].model.model_kwargs": [
         {

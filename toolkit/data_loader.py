@@ -544,6 +544,12 @@ class AiToolkitDataset(LatentCachingMixin, ControlCachingMixin, CLIPCachingMixin
                         )
                     )
                 file_item._control_match_target_res = match_target_res
+                # pixel budget used when reference images are baked into text
+                # embeddings; absent on models that do not resize that way
+                if self.sd is not None and hasattr(self.sd, "control_image_max_pixels"):
+                    file_item._control_image_max_pixels = int(
+                        self.sd.control_image_max_pixels
+                    )
                 self.file_list.append(file_item)
             except Exception as e:
                 print_acc(traceback.format_exc())
