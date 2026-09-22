@@ -1,11 +1,9 @@
 import os
-import time
 from typing import TYPE_CHECKING, List, Optional
 
 import huggingface_hub
 import torch
 from toolkit.config_modules import GenerateImageConfig, ModelConfig
-from toolkit.memory_management.manager import MemoryManager
 from toolkit.metadata import get_meta_for_safetensors
 from toolkit.models.base_model import BaseModel
 from toolkit.basic import flush
@@ -13,15 +11,18 @@ from toolkit.prompt_utils import PromptEmbeds
 from toolkit.samplers.custom_flowmatch_sampler import (
     CustomFlowMatchEulerDiscreteScheduler,
 )
-from toolkit.dequantize import patch_dequantization_on_save
 from toolkit.accelerator import unwrap_model
-from optimum.quanto import freeze, QTensor
-from toolkit.util.quantize import quantize, get_qtype, quantize_model
+from optimum.quanto import QTensor
 
 from transformers import AutoProcessor, Mistral3ForConditionalGeneration
+from toolkit.models.v2.text_encoders.mistral3 import Mistral3TextEncoder
 from .src.model import Flux2, Flux2Params
 from .src.pipeline import Flux2Pipeline
-from .src.autoencoder import AutoEncoder, AutoEncoderParams
+from toolkit.models.v2.vae.flux2_kl import (
+    AutoEncoder,
+    AutoEncoderParams,
+    AutoEncoderSmallDecoderParams,
+)
 from safetensors.torch import load_file, save_file
 from PIL import Image
 
@@ -80,7 +81,6 @@ class Flux2Model(BaseModel):
         self.has_multiple_control_images = True
         # do not resize control images
         self.use_raw_control_images = True
-        self._cached_pipeline = None  # cache pipeline to avoid recreation
 
     # static method to get the noise scheduler
     @staticmethod
@@ -97,33 +97,22 @@ class Flux2Model(BaseModel):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Mistral")
 
-        text_encoder: Mistral3ForConditionalGeneration = (
-            Mistral3ForConditionalGeneration.from_pretrained(
-                MISTRAL_PATH,
-                torch_dtype=dtype,
-            )
+        # load + quantize + offload + placement, all driven by model_config
+        # tie_word_embeddings=False: the checkpoint carries both embed_tokens
+        # and lm_head with different values; the config's tie claim is wrong
+        text_encoder = Mistral3TextEncoder.load(
+            MISTRAL_PATH,
+            subfolder="",
+            tie_word_embeddings=False,
+            **self.component_load_kwargs("te"),
         )
-        text_encoder.to(self.device_torch, dtype=dtype)
-
         flush()
 
-        if self.model_config.quantize_te:
-            self.print_and_status_update("Quantizing Mistral")
-            quantize(text_encoder, weights=get_qtype(self.model_config.qtype))
-            freeze(text_encoder)
-            flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_text_encoder_percent > 0
-        ):
-            MemoryManager.attach(
-                text_encoder,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_text_encoder_percent,
-            )
-
-        tokenizer = AutoProcessor.from_pretrained(MISTRAL_PATH)
+        # fix_mistral_regex=False: keep the exact tokenization flux2 has always
+        # used (True would change the pre-tokenizer and shift conditioning)
+        tokenizer = AutoProcessor.from_pretrained(
+            MISTRAL_PATH, fix_mistral_regex=False
+        )
         return text_encoder, tokenizer
 
     def load_model(self):
@@ -134,9 +123,6 @@ class Flux2Model(BaseModel):
         transformer_path = model_path
 
         self.print_and_status_update("Loading transformer")
-        with torch.device("meta"):
-            transformer = Flux2(self.get_flux2_params())
-
         # use local path if provided
         if os.path.exists(os.path.join(transformer_path, self.flux2_te_filename)):
             transformer_path = os.path.join(transformer_path, self.flux2_te_filename)
@@ -150,38 +136,13 @@ class Flux2Model(BaseModel):
             )
 
         transformer_state_dict = load_file(transformer_path, device="cpu")
+        transformer = Flux2.load_from_state_dict(
+            transformer_state_dict, dtype, config=self.get_flux2_params()
+        )
 
-        # cast to dtype
-        for key in transformer_state_dict:
-            transformer_state_dict[key] = transformer_state_dict[key].to(dtype)
-
-        transformer.load_state_dict(transformer_state_dict, assign=True)
-
-        transformer.to(self.quantize_device, dtype=dtype)
-
-        if self.model_config.quantize:
-            # patch the state dict method
-            patch_dequantization_on_save(transformer)
-            self.print_and_status_update("Quantizing Transformer")
-            quantize_model(self, transformer)
-            flush()
-        else:
-            transformer.to(self.device_torch, dtype=dtype)
+        # quantize + offload + placement, all driven by model_config
+        transformer.aitk_post_load(**self.component_load_kwargs("transformer"))
         flush()
-
-        if (
-            self.model_config.layer_offloading
-            and self.model_config.layer_offloading_transformer_percent > 0
-        ):
-            MemoryManager.attach(
-                transformer,
-                self.device_torch,
-                offload_percent=self.model_config.layer_offloading_transformer_percent,
-            )
-
-        if self.model_config.low_vram:
-            self.print_and_status_update("Moving transformer to CPU")
-            transformer.to("cpu")
 
         text_encoder, tokenizer = self.load_te()
 
@@ -191,41 +152,26 @@ class Flux2Model(BaseModel):
         if os.path.exists(os.path.join(model_path, FLUX2_VAE_FILENAME)):
             vae_path = os.path.join(model_path, FLUX2_VAE_FILENAME)
 
-        # Also check for diffusers-format VAE in model directory
-        # (e.g. flux2_klein_base_9b/vae/diffusion_pytorch_model.safetensors)
-        if vae_path is None:
-            diffusers_vae = os.path.join(model_path, "vae", "diffusion_pytorch_model.safetensors")
-            if os.path.exists(diffusers_vae):
-                vae_path = diffusers_vae
-
         if vae_path is None:
             vae_path = self.flux2_vae_path
 
         if vae_path is None or not os.path.exists(vae_path):
+            vae_filename = FLUX2_VAE_FILENAME
+            if vae_path is not None:
+                # see if it is a filename for huggingface hub
+                if len(vae_path.split("/")) == 3 and vae_path.endswith(".safetensors"):
+                    vae_filename = vae_path.split("/")[-1]
+                    vae_path = "/".join(vae_path.split("/")[:-1])
             p = vae_path if vae_path is not None else model_path
             # assume it is from the hub
             vae_path = huggingface_hub.hf_hub_download(
                 repo_id=p,
-                filename=FLUX2_VAE_FILENAME,
+                filename=vae_filename,
                 token=HF_TOKEN,
             )
-        with torch.device("meta"):
-            vae = AutoEncoder(AutoEncoderParams())
-
-        vae_state_dict = load_file(vae_path, device="cpu")
-
-        # 检测并转换 diffusers 格式的 state_dict
-        # diffusers 使用 "mid_block", "up_blocks", "down_blocks", "resnets" 等命名
-        # AutoEncoder 使用 "mid", "up", "down", "block" 等命名
-        if any(k.startswith("decoder.mid_block.") or k.startswith("encoder.down_blocks.") for k in vae_state_dict):
-            self.print_and_status_update("Converting diffusers VAE format to original format")
-            vae_state_dict = self._convert_diffusers_vae_state_dict(vae_state_dict)
-
-        # cast to dtype
-        for key in vae_state_dict:
-            vae_state_dict[key] = vae_state_dict[key].to(dtype)
-
-        vae.load_state_dict(vae_state_dict, assign=True)
+        
+        # config sniffed from the checkpoint (small-decoder detection)
+        vae = AutoEncoder.load_model(vae_path, dtype=dtype)
 
         self.noise_scheduler = Flux2Model.get_train_scheduler()
 
@@ -250,10 +196,16 @@ class Flux2Model(BaseModel):
 
         flush()
         # just to make sure everything is on the right device and dtype
-        text_encoder[0].to(self.device_torch)
+        if self.model_config.low_vram:
+            text_encoder[0].to("cpu")
+        else:
+            text_encoder[0].to(self.device_torch)
         text_encoder[0].requires_grad_(False)
         text_encoder[0].eval()
-        pipe.transformer = pipe.transformer.to(self.device_torch)
+        if self.model_config.low_vram:
+            pipe.transformer = pipe.transformer.to("cpu")
+        else:
+            pipe.transformer = pipe.transformer.to(self.device_torch)
         flush()
 
         # save it to the model class
@@ -264,100 +216,9 @@ class Flux2Model(BaseModel):
         self.pipeline = pipe
         self.print_and_status_update("Model Loaded")
 
-    @staticmethod
-    def _convert_diffusers_vae_state_dict(sd: dict) -> dict:
-        """将 diffusers 格式的 VAE state_dict 转换为 AutoEncoder 原始格式"""
-        import re
-        new_sd = {}
-
-        for key, value in sd.items():
-            new_key = key
-
-            # ── 顶层 quant_conv → encoder.quant_conv ──
-            # ── 顶层 post_quant_conv → decoder.post_quant_conv ──
-            if key.startswith("quant_conv."):
-                new_key = "encoder." + key
-            elif key.startswith("post_quant_conv."):
-                new_key = "decoder." + key
-
-            # ── conv_norm_out → norm_out ──
-            elif ".conv_norm_out." in key:
-                new_key = key.replace(".conv_norm_out.", ".norm_out.")
-
-            # ── mid_block.attentions.0 → mid.attn_1 ──
-            elif ".mid_block.attentions.0." in key:
-                new_key = key.replace(".mid_block.attentions.0.", ".mid.attn_1.")
-                new_key = new_key.replace(".group_norm.", ".norm.")
-                new_key = new_key.replace(".to_k.", ".k.")
-                new_key = new_key.replace(".to_q.", ".q.")
-                new_key = new_key.replace(".to_v.", ".v.")
-                new_key = new_key.replace(".to_out.0.", ".proj_out.")
-
-            # ── mid_block.resnets.N → mid.block_{N+1} ──
-            elif ".mid_block.resnets." in key:
-                m = re.search(r'\.mid_block\.resnets\.(\d+)\.', key)
-                if m:
-                    idx = int(m.group(1)) + 1
-                    new_key = key.replace(f".mid_block.resnets.{m.group(1)}.", f".mid.block_{idx}.")
-
-            # ── encoder: down_blocks.N.resnets.M → down.N.block.M ──
-            elif "encoder.down_blocks." in key:
-                m = re.search(r'encoder\.down_blocks\.(\d+)\.resnets\.(\d+)\.', key)
-                if m:
-                    new_key = key.replace(
-                        f"encoder.down_blocks.{m.group(1)}.resnets.{m.group(2)}.",
-                        f"encoder.down.{m.group(1)}.block.{m.group(2)}."
-                    )
-                m2 = re.search(r'encoder\.down_blocks\.(\d+)\.downsamplers\.0\.', key)
-                if m2:
-                    new_key = key.replace(
-                        f"encoder.down_blocks.{m2.group(1)}.downsamplers.0.",
-                        f"encoder.down.{m2.group(1)}.downsample."
-                    )
-                # nin_shortcut (conv_shortcut in diffusers)
-                new_key = new_key.replace(".conv_shortcut.", ".nin_shortcut.")
-
-            # ── decoder: up_blocks.N.resnets.M → up.{3-N}.block.M ──
-            elif "decoder.up_blocks." in key:
-                m = re.search(r'decoder\.up_blocks\.(\d+)\.resnets\.(\d+)\.', key)
-                if m:
-                    # diffusers up_blocks 顺序与原始格式相反
-                    orig_idx = 3 - int(m.group(1))
-                    new_key = key.replace(
-                        f"decoder.up_blocks.{m.group(1)}.resnets.{m.group(2)}.",
-                        f"decoder.up.{orig_idx}.block.{m.group(2)}."
-                    )
-                m2 = re.search(r'decoder\.up_blocks\.(\d+)\.upsamplers\.0\.', key)
-                if m2:
-                    orig_idx = 3 - int(m2.group(1))
-                    new_key = key.replace(
-                        f"decoder.up_blocks.{m2.group(1)}.upsamplers.0.",
-                        f"decoder.up.{orig_idx}.upsample."
-                    )
-                # nin_shortcut
-                new_key = new_key.replace(".conv_shortcut.", ".nin_shortcut.")
-
-            # attention 权重: diffusers 存储为 (C, C), AutoEncoder 期望 (C, C, 1, 1)
-            if ".attn_1." in new_key and new_key.endswith(".weight") and value.dim() == 2:
-                value = value.unsqueeze(-1).unsqueeze(-1)
-
-            new_sd[new_key] = value
-
-        return new_sd
-
     def get_generation_pipeline(self):
-        if self._cached_pipeline is not None:
-            print("[generate] reusing cached Flux2Pipeline")
-            # update references in case model weights changed (LoRA merge etc.)
-            self._cached_pipeline.transformer = unwrap_model(self.transformer)
-            self._cached_pipeline.text_encoder = unwrap_model(self.text_encoder[0])
-            self._cached_pipeline.tokenizer = self.tokenizer[0]
-            self._cached_pipeline.vae = unwrap_model(self.vae)
-            return self._cached_pipeline
-
         scheduler = Flux2Model.get_train_scheduler()
 
-        _t0 = time.time()
         pipeline: Flux2Pipeline = Flux2Pipeline(
             scheduler=scheduler,
             text_encoder=unwrap_model(self.text_encoder[0]),
@@ -367,14 +228,9 @@ class Flux2Model(BaseModel):
             text_encoder_type=self.flux2_te_type,
             is_guidance_distilled=self.flux2_is_guidance_distilled,
         )
-        print(f"[generate] Flux2Pipeline created in {time.time()-_t0:.1f}s")
 
-        _t0 = time.time()
         pipeline = pipeline.to(self.device_torch)
-        _gpu_mem = torch.cuda.memory_allocated() / (1024**3) if torch.cuda.is_available() else 0
-        print(f"[generate] pipeline.to(device) took {time.time()-_t0:.1f}s, GPU mem: {_gpu_mem:.1f}GB")
 
-        self._cached_pipeline = pipeline
         return pipeline
 
     def generate_single_image(
@@ -393,7 +249,6 @@ class Flux2Model(BaseModel):
             gen_config.height // self.get_bucket_divisibility()
         ) * self.get_bucket_divisibility()
 
-        _t0 = time.time()
         control_img_list = []
         if gen_config.ctrl_img is not None:
             control_img = Image.open(gen_config.ctrl_img)
@@ -411,14 +266,10 @@ class Flux2Model(BaseModel):
             control_img = Image.open(gen_config.ctrl_img_3)
             control_img = control_img.convert("RGB")
             control_img_list.append(control_img)
-        if control_img_list:
-            print(f"[generate] loaded {len(control_img_list)} control image(s) in {time.time()-_t0:.1f}s")
 
         if not self.flux2_is_guidance_distilled:
             extra["negative_prompt_embeds"] = unconditional_embeds.text_embeds
 
-        _t0 = time.time()
-        print(f"[generate] calling pipeline ({gen_config.width}x{gen_config.height}, {gen_config.num_inference_steps} steps)...")
         img = pipeline(
             prompt_embeds=conditional_embeds.text_embeds,
             height=gen_config.height,
@@ -430,7 +281,6 @@ class Flux2Model(BaseModel):
             control_img_list=control_img_list,
             **extra,
         ).images[0]
-        print(f"[generate] pipeline call took {time.time()-_t0:.1f}s")
         return img
 
     def get_noise_prediction(
@@ -449,10 +299,10 @@ class Flux2Model(BaseModel):
             img_cond_seq: torch.Tensor | None = None
             img_cond_seq_ids: torch.Tensor | None = None
 
-            cached_ctrl = getattr(batch, 'cached_control_latents_list', None)
+            cached_ctrl = getattr(batch, "cached_control_latents_list", None)
 
             if cached_ctrl is not None and len(cached_ctrl) > 0:
-                for ci, sample_latents in enumerate(cached_ctrl):
+                for sample_latents in cached_ctrl:
                     if not sample_latents:
                         continue
                     encoded_refs = [lat.to(self.device_torch) for lat in sample_latents]
@@ -471,10 +321,9 @@ class Flux2Model(BaseModel):
                         batch_control_tensor_list.append(batch.control_tensor[b : b + 1])
 
                 if batch_control_tensor_list is not None:
-                    batch_size, num_channels_latents, height, width = (
+                    batch_size, _num_channels_latents, height, width = (
                         latent_model_input.shape
                     )
-
                     target_pixels = (
                         height
                         * self.pipeline.vae_scale_factor
@@ -489,9 +338,11 @@ class Flux2Model(BaseModel):
                         raise ValueError(
                             "Control tensor list length does not match batch size"
                         )
-                    for ci, control_tensor_list in enumerate(batch_control_tensor_list):
+                    for control_tensor_list in batch_control_tensor_list:
                         controls = []
                         for control_img in control_tensor_list:
+                            # control images are 0-1. Dataloader already aligned
+                            # control1 to the target bucket and left control2+ native.
                             control_img = control_img.to(
                                 self.device_torch, dtype=self.torch_dtype
                             )
@@ -500,27 +351,20 @@ class Flux2Model(BaseModel):
                             control_img = control_img * 2 - 1
                             controls.append(control_img)
 
-                        # control1 (sub_idx==0) optionally aligns with target pixels
-                        # (dataloader already 16-aligned to target bucket); control2+
-                        # always cap to 1024**2 with 16 alignment by default_prep.
                         limit_pixels_list = [
-                            (target_pixels if (sub_idx == 0 and match_target_res) else 1024 * 1024)
+                            (
+                                target_pixels
+                                if (sub_idx == 0 and match_target_res)
+                                else 1024 * 1024
+                            )
                             for sub_idx in range(len(controls))
                         ]
 
-                        _vae_was_offloaded = False
-                        if hasattr(self.vae, 'device') and self.vae.device != self.device_torch:
-                            _vae_orig_device = self.vae.device
-                            _vae_was_offloaded = True
+                        if self.vae.device == torch.device("cpu"):
                             self.vae.to(self.device_torch)
-
                         img_cond_seq_item, img_cond_seq_ids_item = encode_image_refs(
                             self.vae, controls, limit_pixels=limit_pixels_list
                         )
-
-                        if _vae_was_offloaded:
-                            self.vae.to(_vae_orig_device)
-
                         if img_cond_seq is None:
                             img_cond_seq = img_cond_seq_item
                             img_cond_seq_ids = img_cond_seq_ids_item
@@ -539,10 +383,12 @@ class Flux2Model(BaseModel):
                 assert img_cond_seq_ids is not None, (
                     "You need to provide either both or neither of the sequence conditioning"
                 )
-                cond = img_cond_seq if img_cond_seq.device == self.device_torch else img_cond_seq.to(self.device_torch)
-                cond_ids = img_cond_seq_ids if img_cond_seq_ids.device == self.device_torch else img_cond_seq_ids.to(self.device_torch)
-                img_input = torch.cat((img_input, cond), dim=1)
-                img_input_ids = torch.cat((img_input_ids, cond_ids), dim=1)
+                img_input = torch.cat(
+                    (img_input, img_cond_seq.to(img_input.device, img_input.dtype)), dim=1
+                )
+                img_input_ids = torch.cat(
+                    (img_input_ids, img_cond_seq_ids.to(img_input_ids.device)), dim=1
+                )
 
             guidance_vec = torch.full(
                 (img_input.shape[0],),
@@ -554,9 +400,10 @@ class Flux2Model(BaseModel):
             cast_dtype = self.model.dtype
 
         def _prep(t: torch.Tensor, dtype=cast_dtype) -> torch.Tensor:
-            need_move = t.device != self.device_torch or (dtype is not None and t.dtype != dtype)
-            if need_move:
-                t = t.to(self.device_torch, dtype) if dtype else t.to(self.device_torch)
+            if dtype is not None:
+                t = t.to(self.device_torch, dtype)
+            else:
+                t = t.to(self.device_torch)
             return t.clone()
 
         packed_noise_pred = self.transformer(
@@ -620,19 +467,7 @@ class Flux2Model(BaseModel):
     def get_transformer_block_names(self) -> Optional[List[str]]:
         return ["double_blocks", "single_blocks"]
 
-    def convert_lora_weights_before_save(self, state_dict):
-        new_sd = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("transformer.", "diffusion_model.")
-            new_sd[new_key] = value
-        return new_sd
-
-    def convert_lora_weights_before_load(self, state_dict):
-        new_sd = {}
-        for key, value in state_dict.items():
-            new_key = key.replace("diffusion_model.", "transformer.")
-            new_sd[new_key] = value
-        return new_sd
+    lora_keys_use_comfy_prefix = True
 
     def encode_images(self, image_list: List[torch.Tensor], device=None, dtype=None):
         if device is None:
@@ -658,10 +493,10 @@ class Flux2Model(BaseModel):
         target_height: int | None = None,
         target_width: int | None = None,
     ) -> torch.Tensor:
-        """Encode a single control image tensor [0,1] into a VAE latent for caching.
+        """Encode one control image tensor [0, 1] into a VAE latent (C, H, W).
 
-        Equivalent to forward path: control1 (control_index==0) optionally aligns
-        with target pixels when match_target_res=True; control2+ always cap 1024**2.
+        control1 optionally uses the target crop pixel count when match_target_res
+        is set. control2+ always cap at 1024**2. Matches the live forward path.
         """
         with torch.no_grad():
             if self.vae.device == torch.device("cpu"):
@@ -689,3 +524,18 @@ class Flux2Model(BaseModel):
                 img = img.unsqueeze(0)
             encoded = self.vae.encode(img.to(self.vae.device, self.vae.dtype))[0]
             return encoded.detach().cpu()
+
+    def decode_latents(self, latents, device=None, dtype=None):
+        if device is None:
+            device = self.vae_device_torch
+        if dtype is None:
+            dtype = self.vae_torch_dtype
+
+        # Move to vae to device if on cpu
+        if self.vae.device == torch.device("cpu"):
+            self.vae.to(device)
+        latents = latents.to(device, dtype=dtype)
+
+        images = self.vae.decode(latents)
+
+        return images
