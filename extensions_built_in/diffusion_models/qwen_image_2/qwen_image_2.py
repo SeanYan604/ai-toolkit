@@ -150,21 +150,77 @@ class QwenImage2Model(BaseModel):
     # ------------------------------------------------------------------
     # Loading
     # ------------------------------------------------------------------
+    # Comfy-Org single files this arch actually loads. convrot8 is listed
+    # first and attaches as-is; bf16 is only a fallback if that file is absent.
+    _COMFY_TRANSFORMER_FILES = (
+        "diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+        "diffusion_models/qwen_image_2.1_bf16.safetensors",
+    )
+    _COMFY_TEXT_ENCODER_FILES = (
+        "text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+        "text_encoders/qwen3vl_8b_bf16.safetensors",
+    )
+    _COMFY_VAE_FILES = ("vae/qwen_image_2.1_vae_bf16.safetensors",)
+
+    def _qwen_image_21_roots(self):
+        roots = []
+        name_or_path = self.model_config.name_or_path
+        if name_or_path and os.path.isdir(name_or_path):
+            roots.append(name_or_path)
+        kwargs_path = self.model_config.model_kwargs.get("qwen_image_21_path")
+        if kwargs_path:
+            roots.append(kwargs_path)
+        env_path = os.environ.get("QWEN_IMAGE_21_PATH")
+        if env_path:
+            roots.append(env_path)
+        return roots
+
+    @staticmethod
+    def _first_file(root: str, relative_paths):
+        for relative in relative_paths:
+            path = os.path.join(root, relative)
+            if os.path.isfile(path):
+                return path
+        return None
+
+    def _local_comfy_files(self):
+        """Comfy single-file weights under the configured Qwen-Image 2.1 dir.
+
+        The directory also keeps the small config/processor files. Weight
+        shards from ``Qwen/Qwen-Image-2.1`` are not required.
+        """
+        for root in self._qwen_image_21_roots():
+            transformer = self._first_file(root, self._COMFY_TRANSFORMER_FILES)
+            text_encoder = self._first_file(root, self._COMFY_TEXT_ENCODER_FILES)
+            vae = self._first_file(root, self._COMFY_VAE_FILES)
+            if transformer and text_encoder and vae:
+                return root, transformer, text_encoder, vae
+        return None
+
     def load_model(self):
         dtype = self.torch_dtype
         self.print_and_status_update("Loading Qwen-Image 2.1 model")
-        model_path = self.model_config.name_or_path
-        base_model_path = self.model_config.extras_name_or_path
+        local_comfy = self._local_comfy_files()
+        te_file = None
+        vae_file = None
+        if local_comfy is not None:
+            base_model_path, model_path, te_file, vae_file = local_comfy
+            self.print_and_status_update(
+                f"Using local Comfy weights under {base_model_path}"
+            )
+        else:
+            model_path = self.model_config.name_or_path
+            base_model_path = self.model_config.extras_name_or_path
 
-        if base_model_path == model_path and not os.path.isdir(base_model_path):
-            # extras default to name_or_path, which is the comfy repack (or a
-            # single file); neither carries the configs or the processor
-            base_model_path = BASE_REPO
-        elif os.path.isdir(model_path) and os.path.isdir(
-            os.path.join(model_path, "text_encoder")
-        ):
-            # a local full checkpoint supplies its own text encoder / vae
-            base_model_path = model_path
+            if base_model_path == model_path and not os.path.isdir(base_model_path):
+                # extras default to name_or_path, which is the comfy repack (or a
+                # single file); neither carries the configs or the processor
+                base_model_path = BASE_REPO
+            elif os.path.isdir(model_path) and os.path.isdir(
+                os.path.join(model_path, "text_encoder")
+            ):
+                # a local full checkpoint supplies its own text encoder / vae
+                base_model_path = model_path
 
         self.print_and_status_update("Loading transformer")
         transformer = QwenImage21Transformer2DModel.load(
@@ -176,9 +232,17 @@ class QwenImage2Model(BaseModel):
 
         self.print_and_status_update("Loading text encoder")
         processor = QwenImage21TextEncoder.load_processor(base_model_path)
-        text_encoder = QwenImage21TextEncoder.load_model(
-            base_model_path, dtype=dtype, subfolder="text_encoder"
-        )
+        if te_file is not None:
+            text_encoder = QwenImage21TextEncoder.load_model(
+                te_file,
+                dtype=dtype,
+                subfolder="text_encoder",
+                config_path=base_model_path,
+            )
+        else:
+            text_encoder = QwenImage21TextEncoder.load_model(
+                base_model_path, dtype=dtype, subfolder="text_encoder"
+            )
         # the vision tower stays: any prompt may carry reference images. bf16
         # Conv3d has no fast kernel, the equivalent GEMM does
         text_encoder.patch_vision_patch_embed()
@@ -188,9 +252,16 @@ class QwenImage2Model(BaseModel):
         flush()
 
         self.print_and_status_update("Loading VAE")
-        vae = AutoencoderKLQwenImage21.load(
-            base_model_path, **self.component_load_kwargs("vae")
-        )
+        if vae_file is not None:
+            vae = AutoencoderKLQwenImage21.load(
+                vae_file,
+                config_path=base_model_path,
+                **self.component_load_kwargs("vae"),
+            )
+        else:
+            vae = AutoencoderKLQwenImage21.load(
+                base_model_path, **self.component_load_kwargs("vae")
+            )
         vae.requires_grad_(False)
         vae.eval()
 
