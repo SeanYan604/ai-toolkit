@@ -296,9 +296,13 @@ def _import_triton():
     at first compile."""
     import triton as _triton
     import triton.language as _tl
+    from triton.language.extra import libdevice as _libdevice
 
     globals()["triton"] = _triton
     globals()["tl"] = _tl
+    # same constraint as tl: kernels call libdevice.rint, and a function-local
+    # import is invisible to triton's jit (NameError: libdevice is not defined)
+    globals()["libdevice"] = _libdevice
     return _triton, _tl
 
 
