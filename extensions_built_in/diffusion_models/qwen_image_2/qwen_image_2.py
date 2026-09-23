@@ -22,6 +22,7 @@ noise - clean), so `get_noise_prediction` does no time flip or negation.
 """
 
 import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional
 
 import numpy as np
@@ -513,25 +514,47 @@ class QwenImage2Model(BaseModel):
         # reference latents join the sequence in get_noise_prediction, clean
         return latents.detach()
 
-    def get_noise_prediction(
+    @staticmethod
+    def _slice_prompt_embeds(embeds: AdvancedPromptEmbeds, index: List[int]):
+        sliced = AdvancedPromptEmbeds(
+            **{key: [embeds[key][i] for i in index] for key in embeds.keys()}
+        )
+        sliced.frozen_dtype_keys = list(embeds.frozen_dtype_keys)
+        return sliced
+
+    @staticmethod
+    def _slice_controls(batch, index: List[int]):
+        """The control tensors for `index`, in the same shape the forward reads."""
+        if batch is None:
+            return None
+        control_list = getattr(batch, "control_tensor_list", None)
+        control = getattr(batch, "control_tensor", None)
+        if control_list is not None:
+            control_list = [control_list[i] for i in index]
+        elif control is not None:
+            control = control[index]
+        return SimpleNamespace(
+            control_tensor_list=control_list, control_tensor=control
+        )
+
+    def _noise_prediction_group(
         self,
-        latent_model_input: torch.Tensor,  # (B, 64, h, w)
-        timestep: torch.Tensor,  # 0..1000 scale
+        latent_model_input: torch.Tensor,
+        timestep: torch.Tensor,
         text_embeddings: AdvancedPromptEmbeds,
-        batch: "DataLoaderBatchDTO" = None,
+        batch,
         **kwargs,
     ):
-        if self.model.device == torch.device("cpu"):
-            self.model.to(self.device_torch)
+        """One DiT forward. Every row must share a slot count; row 0's layout
+        is what the transformer applies to the whole group."""
         batch_size = latent_model_input.shape[0]
-
         prompt_embeds, prompt_mask, slot_mask = self.pad_prompt_embeds(text_embeddings)
 
-        # The prompt is what decides: it reserved the slots the references go
-        # into, so a prompt encoded without them (a plain T2I dataset, a fully
-        # dropped caption) takes no references here either.
+        # A dropped caption is cached as plain text (0 slots). Feeding that
+        # row's reference images anyway makes the slot check fail, and the DiT
+        # would lay the sequence out from row 0 regardless.
         condition_latents, condition_shapes = None, []
-        if batch is not None and bool(slot_mask.any()):
+        if batch is not None and int(slot_mask[0].sum()) > 0:
             with torch.no_grad():
                 control = batch.control_tensor_list
                 if control is None:
@@ -543,8 +566,6 @@ class QwenImage2Model(BaseModel):
                     samples
                 )
 
-        # toolkit timestep (0..1000, 1000 = pure noise) -> the model's t in [0, 1];
-        # same direction, so a plain divide
         t = timestep.to(self.device_torch, dtype=self.torch_dtype) / 1000
         if t.dim() == 0:
             t = t.unsqueeze(0)
@@ -562,6 +583,45 @@ class QwenImage2Model(BaseModel):
             condition_shapes=condition_shapes,
             **kwargs,
         )
+
+    def get_noise_prediction(
+        self,
+        latent_model_input: torch.Tensor,  # (B, 64, h, w)
+        timestep: torch.Tensor,  # 0..1000 scale
+        text_embeddings: AdvancedPromptEmbeds,
+        batch: "DataLoaderBatchDTO" = None,
+        **kwargs,
+    ):
+        if self.model.device == torch.device("cpu"):
+            self.model.to(self.device_torch)
+
+        slot_counts = [int(mask.sum()) for mask in text_embeddings.image_slot_mask]
+        # Caption dropout mixes 0-slot embeddings into a batch whose other rows
+        # still reserve reference slots. The DiT copies row 0's layout onto
+        # every row, so those groups have to be separate forwards.
+        if len(set(slot_counts)) <= 1:
+            return self._noise_prediction_group(
+                latent_model_input, timestep, text_embeddings, batch, **kwargs
+            )
+
+        groups = {}
+        for row, count in enumerate(slot_counts):
+            groups.setdefault(count, []).append(row)
+        pieces = [None] * len(slot_counts)
+        for index in groups.values():
+            step = timestep
+            if timestep.dim() > 0 and timestep.shape[0] == latent_model_input.shape[0]:
+                step = timestep[index]
+            prediction = self._noise_prediction_group(
+                latent_model_input[index],
+                step,
+                self._slice_prompt_embeds(text_embeddings, index),
+                self._slice_controls(batch, index),
+                **kwargs,
+            )
+            for out_row, src_row in enumerate(index):
+                pieces[src_row] = prediction[out_row]
+        return torch.stack(pieces, dim=0)
 
     def get_loss_target(self, *args, **kwargs):
         # flow-matching velocity target: noise - clean
