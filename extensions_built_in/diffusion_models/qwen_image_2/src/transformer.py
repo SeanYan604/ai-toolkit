@@ -150,7 +150,8 @@ def apply_rotary_emb_qwen(
         return out
     else:
         x_rotated = torch.view_as_complex(x.float().reshape(*x.shape[:-1], -1, 2))
-        freqs_cis = freqs_cis.unsqueeze(1)
+        # [S, D] -> [S, 1, D], or per-sample [B, S, D] -> [B, S, 1, D]; broadcast over heads
+        freqs_cis = freqs_cis.unsqueeze(-2)
         x_out = torch.view_as_real(x_rotated * freqs_cis).flatten(3)
 
         return x_out.type_as(x)
@@ -358,21 +359,25 @@ def build_qwenimage21_block_causal_mask(
 
 
 def _qwenimage21_prefix_segments(
-    image_ids: torch.Tensor, prefix_len: int
-) -> list[tuple[int, int, bool]]:
-    """Split the prefix into `(start, end, is_text)` runs of equal `image_ids`.
+    image_ids: torch.Tensor, prefix_len: int, first_pad: int | None = None
+) -> list[tuple[int, int, bool, bool]]:
+    """Split the prefix into `(start, end, is_text, has_pad)` runs of equal `image_ids`.
 
     This is the block-causal structure in the form [`QwenImage21AttnProcessor`] consumes it, the way
     [`~build_qwenimage21_block_causal_mask`] is the form [`QwenImage21FlexAttnProcessor`] consumes. It only depends on
-    `image_ids` and `prefix_len`, so the model derives it once per forward rather than in every processor call —
-    `tolist()` is a device sync, and there is one processor call per layer.
+    `image_ids`, `prefix_len` and `first_pad`, so the model derives it once per forward rather than in every
+    processor call — `tolist()` is a device sync, and there is one processor call per layer.
+
+    `has_pad` is `True` when the segment's keys `[0, end)` reach the first padded column `first_pad`, i.e. when its
+    attention needs the key-padding mask at all.
     """
     prefix_ids = image_ids[:prefix_len].tolist()
     segments = []
     start = 0
     for index in range(1, prefix_len + 1):
         if index == prefix_len or prefix_ids[index] != prefix_ids[start]:
-            segments.append((start, index, prefix_ids[start] < 0))
+            has_pad = first_pad is not None and index > first_pad
+            segments.append((start, index, prefix_ids[start] < 0, has_pad))
             start = index
     return segments
 
@@ -451,8 +456,9 @@ class QwenImage21FlexAttnProcessor:
         layer_cache: QwenImage21KVLayerCache | None = None,
         kv_cache_mode: str | None = None,
         cache_write_slice: slice | None = None,
-        segments: list[tuple[int, int, bool]] | None = None,
+        segments: list[tuple[int, int, bool, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
+        key_varlen: tuple[torch.Tensor, torch.Tensor, int] | None = None,
     ) -> torch.Tensor:
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
             attn,
@@ -525,11 +531,21 @@ class QwenImage21FlexAttnProcessor:
         return attn.to_out[1](hidden_states)
 
 
+def _qwenimage21_key_varlen(
+    key_valid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Packing metadata for [`_attend_valid_keys`]: flat indices of the valid keys, their `cu_seqlens`, and an upper
+    bound on the per-sample key count. Built once per forward, so the per-layer calls never sync."""
+    flat_index = key_valid.flatten().nonzero(as_tuple=True)[0]
+    cu_k = F.pad(key_valid.sum(dim=1).cumsum(0), (1, 0)).to(torch.int32)
+    return flat_index, cu_k, key_valid.shape[1]
+
+
 def _attend_valid_keys(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
-    key_valid: torch.Tensor,
+    key_varlen: tuple[torch.Tensor, torch.Tensor, int],
 ) -> torch.Tensor:
     """Full attention over valid keys only.
 
@@ -537,36 +553,21 @@ def _attend_valid_keys(
     varlen attention so the score matrix is never materialized. RoPE is already
     applied, so dropping padded keys does not move the remaining positions.
     """
-    if bool(key_valid.all()):
-        return dispatch_attention_fn(
-            query,
-            key,
-            value,
-            attn_mask=None,
-            dropout_p=0.0,
-            backend=None,
-        )
     from flash_attn import flash_attn_varlen_func
 
-    query = query.contiguous()
-    key = key.contiguous()
-    value = value.contiguous()
-    valid = key_valid.bool()
+    flat_index, cu_k, max_k = key_varlen
     batch, q_len, heads, dim = query.shape
-    lengths = valid.sum(dim=-1)
     cu_q = torch.arange(
         0, (batch + 1) * q_len, q_len, device=query.device, dtype=torch.int32
     )
-    cu_k = torch.zeros(batch + 1, device=query.device, dtype=torch.int32)
-    cu_k[1:] = lengths.cumsum(0).to(torch.int32)
     out = flash_attn_varlen_func(
         query.reshape(batch * q_len, heads, dim),
-        key[valid],
-        value[valid],
+        key.flatten(0, 1).index_select(0, flat_index),
+        value.flatten(0, 1).index_select(0, flat_index),
         cu_q,
         cu_k,
         q_len,
-        key.shape[1],
+        max_k,
         dropout_p=0.0,
         causal=False,
     )
@@ -594,8 +595,9 @@ class QwenImage21AttnProcessor:
         layer_cache: QwenImage21KVLayerCache | None = None,
         kv_cache_mode: str | None = None,
         cache_write_slice: slice | None = None,
-        segments: list[tuple[int, int, bool]] | None = None,
+        segments: list[tuple[int, int, bool, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
+        key_varlen: tuple[torch.Tensor, torch.Tensor, int] | None = None,
     ) -> torch.Tensor:
         query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
             attn,
@@ -623,7 +625,7 @@ class QwenImage21AttnProcessor:
             # `attention_mask` may hold the flex `BlockMask` of the same structure, which is not used here.
             prefix_len = segments[-1][1] if segments else 0
             outputs = []
-            for start, end, is_text in segments:
+            for start, end, is_text, has_pad in segments:
                 seg_mask = None
                 if is_text:
                     seg_len = end - start
@@ -643,19 +645,7 @@ class QwenImage21AttnProcessor:
                         ],
                         dim=1,
                     )[None, None]
-                if not is_text and key_valid is not None:
-                    # Image blocks are bidirectional. Padding lives only in text,
-                    # so dropping those keys is the whole mask.
-                    outputs.append(
-                        _attend_valid_keys(
-                            query[:, start:end],
-                            key[:, :end],
-                            value[:, :end],
-                            key_valid[:, :end],
-                        )
-                    )
-                    continue
-                if key_valid is not None:
+                if has_pad:
                     seg_key_valid = key_valid[:, None, None, :end]
                     seg_mask = (
                         seg_key_valid
@@ -673,7 +663,7 @@ class QwenImage21AttnProcessor:
                         parallel_config=self._parallel_config,
                     )
                 )
-            if key_valid is None:
+            if key_varlen is None:
                 target = dispatch_attention_fn(
                     query[:, prefix_len:],
                     key,
@@ -688,7 +678,7 @@ class QwenImage21AttnProcessor:
                     query[:, prefix_len:],
                     key,
                     value,
-                    key_valid,
+                    key_varlen,
                 )
             outputs.append(target)
             hidden_states = torch.cat(outputs, dim=1)
@@ -788,8 +778,9 @@ class QwenImage21TransformerBlock(nn.Module):
         layer_cache: QwenImage21KVLayerCache | None = None,
         kv_cache_mode: str | None = None,
         cache_write_slice: slice | None = None,
-        segments: list[tuple[int, int, bool]] | None = None,
+        segments: list[tuple[int, int, bool, bool]] | None = None,
         key_valid: torch.Tensor | None = None,
+        key_varlen: tuple[torch.Tensor, torch.Tensor, int] | None = None,
     ) -> torch.Tensor:
         mod1, mod2 = modulation.chunk(2, dim=-1)
 
@@ -805,6 +796,7 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_write_slice=cache_write_slice,
             segments=segments,
             key_valid=key_valid,
+            key_varlen=key_varlen,
         )
         hidden_states = hidden_states + img_gate1.tanh() * attn_output
 
@@ -860,7 +852,14 @@ class QwenImage21Rope(nn.Module):
         img_shapes: list[tuple[int, int, int]],
         image_pad_mask: torch.Tensor,
         device: torch.device,
+        key_valid: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        r"""
+        Returns `(seq_len, dim)` shared by the batch, or `(batch_size, seq_len, dim)` when `key_valid` is given.
+
+        `key_valid` is the `(batch_size, seq_len)` bool padding mask of the joint sequence. Padding takes no position,
+        so every sample gets the positions it would have unpadded.
+        """
         self.freqs = [freq.to(device) for freq in self.freqs]
 
         frame_index, height_index, width_index = [], [], []
@@ -898,12 +897,17 @@ class QwenImage21Rope(nn.Module):
             frame_index.extend(range(position, position + total_len - cursor))
 
         frame_index = torch.tensor(frame_index, dtype=torch.long, device=device)
+        if key_valid is not None:
+            # Padding only sits in text, so a token's position drops by the padding before it; image blocks keep their
+            # frozen frame. The clamp only touches padding rows, which are never attended to as keys.
+            pad_before = torch.cumsum((~key_valid.bool()).long(), dim=1)
+            frame_index = (frame_index[None] - pad_before).clamp_min(0)
         height_index = frame_index.clone()
         width_index = frame_index.clone()
-        height_index[image_pad_mask] = torch.tensor(
+        height_index[..., image_pad_mask] = torch.tensor(
             image_height_index, dtype=torch.long, device=device
         )
-        width_index[image_pad_mask] = torch.tensor(
+        width_index[..., image_pad_mask] = torch.tensor(
             image_width_index, dtype=torch.long, device=device
         )
 
@@ -1213,8 +1217,35 @@ class QwenImage21Transformer2DModel(
         joint_hidden_states = joint_hidden_states.repeat_interleave(repeats, dim=1)
         joint_hidden_states[:, image_pad_mask] = hidden_states
 
+        # Right-padded prompt positions must never be attended to, on any path. Text positions of the joint sequence
+        # line up, in order, with the non-image positions of the vision-language sequence — the two are interleaved,
+        # so the mask cannot be sliced off as a prefix.
+        joint_key_valid, first_pad = None, None
+        if encoder_hidden_states_mask is not None:
+            joint_key_valid = torch.ones(
+                batch_size,
+                image_pad_mask.shape[0],
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
+            vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
+            joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[
+                :, vlm_text_positions
+            ]
+            pad_columns = (~joint_key_valid).any(dim=0)
+            first_pad = int(
+                torch.where(pad_columns.any(), pad_columns.int().argmax(), -1)
+            )
+            if first_pad < 0:
+                joint_key_valid, first_pad = None, None
+
+        # Per-sample positions only when something is padded; otherwise one `(seq_len, dim)` table serves the batch.
         rotary_emb = self.pos_embed(
-            img_shapes[0], image_pad_mask, device=hidden_states.device
+            img_shapes[0],
+            image_pad_mask,
+            device=hidden_states.device,
+            key_valid=joint_key_valid,
         )
         image_ids, target_token_mask = self.build_token_metadata(
             image_pad_mask, img_shapes[0]
@@ -1231,23 +1262,6 @@ class QwenImage21Transformer2DModel(
         temb = self.time_text_embed(timestep, hidden_states)
         modulation = self.modulation(temb)
 
-        # Right-padded prompt positions must never be attended to, on any path. Text positions of the joint sequence
-        # line up, in order, with the non-image positions of the vision-language sequence — the two are interleaved,
-        # so the mask cannot be sliced off as a prefix.
-        joint_key_valid = None
-        if encoder_hidden_states_mask is not None:
-            joint_key_valid = torch.ones(
-                batch_size,
-                image_pad_mask.shape[0],
-                dtype=torch.bool,
-                device=hidden_states.device,
-            )
-            text_positions = (~image_pad_mask).nonzero(as_tuple=True)[0]
-            vlm_text_positions = ~img_mask[0][: encoder_hidden_states_mask.shape[1]]
-            joint_key_valid[:, text_positions] = encoder_hidden_states_mask.bool()[
-                :, vlm_text_positions
-            ]
-
         prefix_len = int((~target_token_mask).sum())
 
         if kv_cache_mode == "cached":
@@ -1255,13 +1269,13 @@ class QwenImage21Transformer2DModel(
             # attention for target rows (they see the entire prefix + their own block), so only the padding mask is
             # needed.
             joint_hidden_states = joint_hidden_states[:, prefix_len:]
-            rotary_emb = rotary_emb[prefix_len:]
+            rotary_emb = rotary_emb[..., prefix_len:, :]
             modulation_mask = modulation_mask[prefix_len:]
             attention_mask = (
                 None if joint_key_valid is None else joint_key_valid[:, None, None, :]
             )
             cache_write_slice = None
-            block_segments, block_key_valid = None, None
+            block_segments, block_key_valid, block_key_varlen = None, None, None
         else:
             # prefill: the whole joint sequence. The block-causal structure goes down in whichever form the
             # installed processors read it — a flex `BlockMask`, per-segment boundaries, or both for a mixed set —
@@ -1284,12 +1298,17 @@ class QwenImage21Transformer2DModel(
                     isinstance(processor, QwenImage21FlexAttnProcessor)
                     for processor in processors
                 )
-                else _qwenimage21_prefix_segments(image_ids, prefix_len)
+                else _qwenimage21_prefix_segments(image_ids, prefix_len, first_pad)
             )
             cache_write_slice = (
                 slice(0, prefix_len) if kv_cache_mode == "extract" else None
             )
             block_key_valid = joint_key_valid
+            block_key_varlen = (
+                _qwenimage21_key_varlen(joint_key_valid)
+                if joint_key_valid is not None and block_segments is not None
+                else None
+            )
 
         for index_block, block in enumerate(self.transformer_blocks):
             layer_cache = (
@@ -1308,6 +1327,7 @@ class QwenImage21Transformer2DModel(
                     cache_write_slice,
                     block_segments,
                     block_key_valid,
+                    block_key_varlen,
                 )
             else:
                 joint_hidden_states = block(
@@ -1321,6 +1341,7 @@ class QwenImage21Transformer2DModel(
                     cache_write_slice=cache_write_slice,
                     segments=block_segments,
                     key_valid=block_key_valid,
+                    key_varlen=block_key_varlen,
                 )
 
         joint_hidden_states = self.norm_out(joint_hidden_states, temb, modulation_mask)
