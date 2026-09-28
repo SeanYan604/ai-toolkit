@@ -525,6 +525,54 @@ class QwenImage21FlexAttnProcessor:
         return attn.to_out[1](hidden_states)
 
 
+def _attend_valid_keys(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_valid: torch.Tensor,
+) -> torch.Tensor:
+    """Full attention over valid keys only.
+
+    Matches a bool key-padding mask, but packs the valid keys and runs Flash
+    varlen attention so the score matrix is never materialized. RoPE is already
+    applied, so dropping padded keys does not move the remaining positions.
+    """
+    if bool(key_valid.all()):
+        return dispatch_attention_fn(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=0.0,
+            backend=None,
+        )
+    from flash_attn import flash_attn_varlen_func
+
+    query = query.contiguous()
+    key = key.contiguous()
+    value = value.contiguous()
+    valid = key_valid.bool()
+    batch, q_len, heads, dim = query.shape
+    lengths = valid.sum(dim=-1)
+    cu_q = torch.arange(
+        0, (batch + 1) * q_len, q_len, device=query.device, dtype=torch.int32
+    )
+    cu_k = torch.zeros(batch + 1, device=query.device, dtype=torch.int32)
+    cu_k[1:] = lengths.cumsum(0).to(torch.int32)
+    out = flash_attn_varlen_func(
+        query.reshape(batch * q_len, heads, dim),
+        key[valid],
+        value[valid],
+        cu_q,
+        cu_k,
+        q_len,
+        key.shape[1],
+        dropout_p=0.0,
+        causal=False,
+    )
+    return out.view(batch, q_len, heads, dim)
+
+
 class QwenImage21AttnProcessor:
     r"""
     Attention processor for Qwen-Image 2.1 that needs neither `flex_attention` nor a compiled model.
@@ -595,6 +643,18 @@ class QwenImage21AttnProcessor:
                         ],
                         dim=1,
                     )[None, None]
+                if not is_text and key_valid is not None:
+                    # Image blocks are bidirectional. Padding lives only in text,
+                    # so dropping those keys is the whole mask.
+                    outputs.append(
+                        _attend_valid_keys(
+                            query[:, start:end],
+                            key[:, :end],
+                            value[:, :end],
+                            key_valid[:, :end],
+                        )
+                    )
+                    continue
                 if key_valid is not None:
                     seg_key_valid = key_valid[:, None, None, :end]
                     seg_mask = (
@@ -613,19 +673,24 @@ class QwenImage21AttnProcessor:
                         parallel_config=self._parallel_config,
                     )
                 )
-            outputs.append(
-                dispatch_attention_fn(
+            if key_valid is None:
+                target = dispatch_attention_fn(
                     query[:, prefix_len:],
                     key,
                     value,
-                    attn_mask=None
-                    if key_valid is None
-                    else key_valid[:, None, None, :],
+                    attn_mask=None,
                     dropout_p=0.0,
                     backend=None,
                     parallel_config=self._parallel_config,
                 )
-            )
+            else:
+                target = _attend_valid_keys(
+                    query[:, prefix_len:],
+                    key,
+                    value,
+                    key_valid,
+                )
+            outputs.append(target)
             hidden_states = torch.cat(outputs, dim=1)
         hidden_states = hidden_states[:, :seq_len_q]
         hidden_states = hidden_states.flatten(2, 3).type_as(query)
