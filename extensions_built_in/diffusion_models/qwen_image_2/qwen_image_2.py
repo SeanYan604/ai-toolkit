@@ -370,7 +370,7 @@ class QwenImage2Model(BaseModel):
         already smaller keeps its size (only snapped to the 32 px grid), so a
         bucket-resized training reference stays at the target resolution."""
         return int(
-            self.model_config.model_kwargs.get("control_image_max_pixels", 1024 * 1024)
+            self.model_config.model_kwargs.get("control_image_max_pixels", 2048 * 2048)
         )
 
     @property
